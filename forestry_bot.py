@@ -199,7 +199,7 @@ QUOTES = [
 # ニュース収集（Web検索）
 # =========================================================
 def fetch_forestry_news(query):
-    """DuckDuckGoで林業関連ニュースを検索して取得する"""
+    """DuckDuckGoで林業関連ニュースを検索して取得する。(snippet_text, article_url) を返す"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -209,15 +209,28 @@ def fetch_forestry_news(query):
         soup = BeautifulSoup(response.text, 'html.parser')
         
         results = []
+        first_url = None
         for result in soup.find_all('div', class_='result__body')[:3]:
+            title_el = result.find('a', class_='result__a')
             snippet = result.find('a', class_='result__snippet')
             if snippet:
                 results.append(snippet.get_text(strip=True))
+            # 最初の記事URLを取得（DuckDuckGoのリダイレクトURLを解決）
+            if first_url is None and title_el and title_el.get('href'):
+                raw_href = title_el.get('href', '')
+                # DuckDuckGoのリダイレクトURL (/l/?uddg=...) を実URLに変換
+                if 'uddg=' in raw_href:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
+                    if 'uddg' in parsed:
+                        first_url = urllib.parse.unquote(parsed['uddg'][0])
+                elif raw_href.startswith('http'):
+                    first_url = raw_href
         
-        return " ".join(results) if results else ""
+        return " ".join(results) if results else "", first_url
     except Exception as e:
         logger.warning(f"ニュース取得エラー: {e}")
-        return ""
+        return "", None
 
 
 def fetch_global_forest_buzz():
@@ -249,9 +262,20 @@ def fetch_global_forest_buzz():
             title_el = result.find('a', class_='result__a')
             snippet_el = result.find('a', class_='result__snippet')
             if title_el and snippet_el:
+                # DuckDuckGoのリダイレクトURLを実URLに変換
+                article_url = None
+                raw_href = title_el.get('href', '')
+                if 'uddg=' in raw_href:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
+                    if 'uddg' in parsed:
+                        article_url = urllib.parse.unquote(parsed['uddg'][0])
+                elif raw_href.startswith('http'):
+                    article_url = raw_href
                 articles.append({
                     "title": title_el.get_text(strip=True),
-                    "snippet": snippet_el.get_text(strip=True)
+                    "snippet": snippet_el.get_text(strip=True),
+                    "url": article_url
                 })
         
         if articles:
@@ -520,11 +544,26 @@ def generate_quote_tweet(quote_data):
 # =========================================================
 # X投稿
 # =========================================================
-def post_to_x(tweet_text):
-    """Xにツイートを投稿する"""
+def post_to_x(tweet_text, article_url=None):
+    """
+    Xにツイートを投稿する。
+    article_urlが指定された場合、本文末尾に記事URLを付ける。
+    X上でURLは23文字としてカウントされるため、本文は117文字以内に制限する。
+    """
     if not tweet_text:
         logger.error("投稿テキストが空です")
         return False
+    
+    # URLを付ける場合は本文を117文字以内に収める（URLは23文字としてカウント）
+    if article_url:
+        # 本文が117文字を超える場合は切り詰める
+        body = tweet_text
+        if len(body) > 117:
+            body = body[:116] + "…"
+        full_text = f"{body}\n{article_url}"
+        logger.info(f"記事URL付き投稿: {article_url}")
+    else:
+        full_text = tweet_text
     
     try:
         client = tweepy.Client(
@@ -533,11 +572,11 @@ def post_to_x(tweet_text):
             access_token=X_ACCESS_TOKEN,
             access_token_secret=X_ACCESS_TOKEN_SECRET
         )
-        response = client.create_tweet(text=tweet_text)
+        response = client.create_tweet(text=full_text)
         tweet_id = response.data['id']
         logger.info(f"投稿成功！ Tweet ID: {tweet_id}")
-        logger.info(f"投稿内容: {tweet_text}")
-        logger.info(f"文字数: {len(tweet_text)}")
+        logger.info(f"投稿内容: {full_text}")
+        logger.info(f"文字数(本文): {len(tweet_text)}")
         return True
     except Exception as e:
         logger.error(f"X投稿エラー: {e}")
@@ -553,47 +592,53 @@ def early_morning_job():
     logger.info("=== 朝6時 海外バズ記事紹介ジョブ開始 ===")
     query, articles = fetch_global_forest_buzz()
     tweet = generate_global_buzz_tweet(query, articles)
+    # 最初の記事URLを取得
+    article_url = None
+    if articles:
+        article_url = articles[0].get('url')
     if tweet:
-        post_to_x(tweet)
+        post_to_x(tweet, article_url)
 
 def morning_job():
     """朝7時の投稿（国内政策・ニュース系）"""
     logger.info("=== 朝7時 国内政策ジョブ開始 ===")
     category, topic = random.choice(MORNING_TOPICS)
-    news = fetch_forestry_news(f"林業 {topic[:20]} 2025 2026")
+    news, article_url = fetch_forestry_news(f"林業 {topic[:20]} 2025 2026")
     tweet = generate_tweet(category, topic, news)
     if tweet:
-        post_to_x(tweet)
+        post_to_x(tweet, article_url)
 
 def noon_job():
     """昼12時の投稿（木材市況・テクノロジー系）"""
     logger.info("=== 昼12時 木材市況・テクノロジージョブ開始 ===")
     category, topic = random.choice(NOON_TOPICS)
-    news = fetch_forestry_news(f"林業 {topic[:20]} 最新")
+    news, article_url = fetch_forestry_news(f"林業 {topic[:20]} 最新")
     tweet = generate_tweet(category, topic, news)
     if tweet:
-        post_to_x(tweet)
+        post_to_x(tweet, article_url)
 
 def pre_evening_job():
-    """夜20時の投稿（有名経営者・心理学者の引用＋林業経営コメント）"""
-    logger.info("=== 夜20時 引用・経営論ジョブ開始 ===")
+    """大20時の投稿（有名経営者・心理学者の引用＋林業経営コメント）"""
+    logger.info("=== 大20時 引用・経営論ジョブ開始 ===")
     quote_data = random.choice(QUOTES)
     logger.info(f"引用する人物: {quote_data['person']}")
     tweet = generate_quote_tweet(quote_data)
+    # 引用元人物の関連記事を検索してURLを取得
+    _, article_url = fetch_forestry_news(f"{quote_data['person']} {quote_data['theme'][:20]}")
     if tweet:
-        post_to_x(tweet)
+        post_to_x(tweet, article_url)
 
 def evening_job():
-    """夜21時の投稿（海外トレンド・研究情報系）"""
-    logger.info("=== 夜21時 海外トレンド・研究情報ジョブ開始 ===")
+    """大21時の投稿（海外トレンド・研究情報系）"""
+    logger.info("=== 大21時 海外トレンド・研究情報ジョブ開始 ===")
     category, topic = random.choice(EVENING_TOPICS)
     if category == "海外トレンド":
-        news = fetch_forestry_news("forest forestry trend 2025 2026")
+        news, article_url = fetch_forestry_news("forest forestry trend 2025 2026")
     else:
-        news = fetch_forestry_news(f"森林総合研究所 {topic[:15]}")
+        news, article_url = fetch_forestry_news(f"森林総合研究所 {topic[:15]}")
     tweet = generate_tweet(category, topic, news)
     if tweet:
-        post_to_x(tweet)
+        post_to_x(tweet, article_url)
 
 
 # =========================================================
