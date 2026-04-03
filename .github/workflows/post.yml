@@ -1,0 +1,63 @@
+name: 林業X自動投稿
+
+on:
+  schedule:
+    # 朝6時 JST = UTC 21:00（前日）
+    - cron: '0 21 * * *'
+    # 朝7時 JST = UTC 22:00（前日）
+    - cron: '0 22 * * *'
+    # 昼12時 JST = UTC 03:00
+    - cron: '0 3 * * *'
+    # 夜20時 JST = UTC 11:00
+    - cron: '0 11 * * *'
+    # 夜21時 JST = UTC 12:00
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: '投稿スロット（06:00 / 07:00 / 12:00 / 20:00 / 21:00）'
+        required: false
+        default: ''
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージをインストール
+        run: |
+          pip install tweepy openai requests beautifulsoup4 schedule
+
+      - name: 投稿スロットを判定して実行
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: |
+          # 手動実行でスロット指定がある場合はそれを使う
+          if [ -n "${{ github.event.inputs.slot }}" ]; then
+            SLOT="${{ github.event.inputs.slot }}"
+          else
+            # UTC時刻からJSTスロットを判定
+            UTC_HOUR=$(date -u +%H)
+            case $UTC_HOUR in
+              21) SLOT="06:00" ;;
+              22) SLOT="07:00" ;;
+              03) SLOT="12:00" ;;
+              11) SLOT="20:00" ;;
+              12) SLOT="21:00" ;;
+              *) SLOT="06:00" ;;
+            esac
+          fi
+          echo "実行スロット: $SLOT"
+          python forestry_bot.py $SLOT
