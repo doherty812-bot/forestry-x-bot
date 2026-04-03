@@ -199,35 +199,37 @@ QUOTES = [
 # ニュース収集（Web検索）
 # =========================================================
 def fetch_forestry_news(query):
-    """DuckDuckGoで林業関連ニュースを検索して取得する。(snippet_text, article_url) を返す"""
+    """
+    Google News RSSで林業関連ニュースを検索して取得する。
+    (snippet_text, article_url) のタプルを返す。
+    """
+    import xml.etree.ElementTree as ET
+    import urllib.parse
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
-        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&t=h_&ia=news"
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
+        response = requests.get(rss_url, headers=headers, timeout=10)
         
-        results = []
+        if response.status_code != 200:
+            return "", None
+        
+        root = ET.fromstring(response.content)
+        items = root.findall('.//item')
+        
+        snippets = []
         first_url = None
-        for result in soup.find_all('div', class_='result__body')[:3]:
-            title_el = result.find('a', class_='result__a')
-            snippet = result.find('a', class_='result__snippet')
-            if snippet:
-                results.append(snippet.get_text(strip=True))
-            # 最初の記事URLを取得（DuckDuckGoのリダイレクトURLを解決）
-            if first_url is None and title_el and title_el.get('href'):
-                raw_href = title_el.get('href', '')
-                # DuckDuckGoのリダイレクトURL (/l/?uddg=...) を実URLに変換
-                if 'uddg=' in raw_href:
-                    import urllib.parse
-                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
-                    if 'uddg' in parsed:
-                        first_url = urllib.parse.unquote(parsed['uddg'][0])
-                elif raw_href.startswith('http'):
-                    first_url = raw_href
+        for item in items[:3]:
+            title = item.find('title')
+            link = item.find('link')
+            description = item.find('description')
+            if title is not None:
+                snippets.append(title.text or '')
+            if first_url is None and link is not None and link.text:
+                first_url = link.text
         
-        return " ".join(results) if results else "", first_url
+        return " ".join(snippets) if snippets else "", first_url
     except Exception as e:
         logger.warning(f"ニュース取得エラー: {e}")
         return "", None
@@ -235,16 +237,19 @@ def fetch_forestry_news(query):
 
 def fetch_global_forest_buzz():
     """
-    海外の森林・林業関連のバズ記事・トレンドトピックを取得する。
+    海外の森林・林業関連のバズ記事・トレンドトピックをGoogle News RSSで取得する。
     複数の英語キーワードで検索し、最も関連性の高い情報を返す。
     """
+    import xml.etree.ElementTree as ET
+    import urllib.parse
+    
     search_queries = [
-        "forest management innovation 2026",
-        "forestry technology AI drones 2026",
-        "sustainable forest carbon credits 2026",
-        "global deforestation reforestation news 2026",
-        "timber market wood price trend 2026",
-        "smart forestry digital twin 2026",
+        "forest management innovation",
+        "forestry technology AI drones",
+        "sustainable forest carbon credits",
+        "deforestation reforestation news",
+        "timber market wood price trend",
+        "smart forestry digital",
     ]
     query = random.choice(search_queries)
     logger.info(f"海外バズ記事検索クエリ: {query}")
@@ -253,28 +258,25 @@ def fetch_global_forest_buzz():
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
-        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&t=h_&ia=news"
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en&gl=US&ceid=US:en"
+        response = requests.get(rss_url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return query, []
+        
+        root = ET.fromstring(response.content)
+        items = root.findall('.//item')
         
         articles = []
-        for result in soup.find_all('div', class_='result__body')[:5]:
-            title_el = result.find('a', class_='result__a')
-            snippet_el = result.find('a', class_='result__snippet')
-            if title_el and snippet_el:
-                # DuckDuckGoのリダイレクトURLを実URLに変換
-                article_url = None
-                raw_href = title_el.get('href', '')
-                if 'uddg=' in raw_href:
-                    import urllib.parse
-                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
-                    if 'uddg' in parsed:
-                        article_url = urllib.parse.unquote(parsed['uddg'][0])
-                elif raw_href.startswith('http'):
-                    article_url = raw_href
+        for item in items[:5]:
+            title = item.find('title')
+            link = item.find('link')
+            description = item.find('description')
+            if title is not None:
+                article_url = link.text if link is not None else None
                 articles.append({
-                    "title": title_el.get_text(strip=True),
-                    "snippet": snippet_el.get_text(strip=True),
+                    "title": title.text or '',
+                    "snippet": (description.text or '')[:200] if description is not None else '',
                     "url": article_url
                 })
         
