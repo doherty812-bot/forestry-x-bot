@@ -8,7 +8,7 @@
   朝6時  : 海外の森林関連バズ記事を日本語で紹介
   朝7時  : 国内政策・林業ニュース
   昼12時 : 木材市況・テクノロジー
-  夜20時 : 有名経営者・心理学者の引用＋林業経営への応用コメント
+  夜20時 : その日のバズ記事を引用し、林業経営者の視座で深みのある投稿
   夜21時 : 海外トレンド・研究情報
 """
 
@@ -289,6 +289,67 @@ def fetch_global_forest_buzz():
 
 
 # =========================================================
+# その日のバズ記事取得（夜20時渠用）
+# =========================================================
+def fetch_todays_buzz_article():
+    """
+    その日のバズ記事をGoogle News RSSから取得する。
+    ビジネス・経済・社会・テクノロジー分野から幅広く取得し、
+    林業経営に応用できる記事を選択する。
+    (title, snippet, url) のタプルを返す。
+    """
+    import xml.etree.ElementTree as ET
+    import urllib.parse
+    
+    # 幅広い分野からバズ記事を取得するクエリリスト
+    buzz_queries = [
+        "経営 戦略論",
+        "人手不足 自動化",
+        "地方創生 産業",
+        "カーボンニュートラル ビジネス",
+        "デジタル変革 中小企業",
+        "サプライチェーン リスク",
+        "AI 産業変革",
+        "少子化 地方経済",
+        "再生可能エネルギー ビジネス",
+        "農林水産業 テクノロジー",
+    ]
+    query = random.choice(buzz_queries)
+    logger.info(f"夜20時バズ記事検索クエリ: {query}")
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
+        response = requests.get(rss_url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return None, None, None
+        
+        root = ET.fromstring(response.content)
+        items = root.findall('.//item')
+        
+        if not items:
+            return None, None, None
+        
+        # 最新記事の先頭3件からランダムに1件選択
+        selected = random.choice(items[:3])
+        title = selected.find('title')
+        link = selected.find('link')
+        description = selected.find('description')
+        
+        title_text = title.text if title is not None else ''
+        url_text = link.text if link is not None else None
+        snippet_text = (description.text or '')[:300] if description is not None else ''
+        
+        return title_text, snippet_text, url_text
+    except Exception as e:
+        logger.warning(f"バズ記事取得エラー: {e}")
+        return None, None, None
+
+
+# =========================================================
 # ツイート生成（通常）
 # =========================================================
 def generate_tweet(category, topic, news_context=""):
@@ -468,37 +529,48 @@ def generate_global_buzz_tweet(query, articles):
 
 
 # =========================================================
-# ツイート生成（有名人引用＋林業経営コメント）
+# ツイート生成（その日のバズ記事引用＋林業経営者視座の深みある投稿）
 # =========================================================
-def generate_quote_tweet(quote_data):
+def generate_buzz_insight_tweet(article_title, article_snippet):
     """
-    有名経営者・心理学者の引用を踏まえた林業経営コメントツイートを生成する（夜20時枠）
+    その日のバズ記事を引用し、林業経営者の視座で深みのある投稿を生成する（夜20時渠）
     """
     system_prompt = """
-あなたは新潟で1,500ha規模の森林経営計画を管理する林業経営者「岸本一夫」として、
-有名経営者・思想家・心理学者の言葉を引用し、林業経営に役立つ視点でコメントするX投稿を作成します。
+あなたは新潟で１，５００ha規模の森林経営計画を管理し、将来的に3，000haへの拡大を見据える林業経営者「岸本一夫」として、
+その日のバズ記事を読んで、林業経営・森林・地域経済の視座から深みのあるX投稿を作成します。
+
+【人物像】
+・山を「所有」ではなく「経営資源」として捉える実務家
+・エビデンスに基づいた分析的な思考を重視
+・地方の人口減少・人手不足を冷静に見据え、AI・ロボット活用を必然的手段として捐える
+・現場の泥臭さを知りつつ、判断の精度を高めるために外部知見を取り込む
+
+【投稿の目的】
+その日のバズ記事のテーマを詰め、林業経営・森林管理・地域経済にどう結びつくかを自分の言葉で語る。
+単なるニュースの紹介ではなく、林業経営者としての実務的・分析的な視点を加える。
 
 【文体の特徴（最重要）】
 ・1文ごとに必ず改行する。句点「。」の後は必ず改行すること
 ・短文・中文中心（1文あたり20〜40文字程度）
 ・「です」「ます」調を基本とする。語尾は「〜です。」「〜ます。」「〜ですね。」「〜でしょうか。」「〜かもしれません。」など
-・引用は短く（20〜30文字程度）、コメントは実務的・分析的に
 ・「〜だろう」「〜だな」「〜かな」「〜ですな」などの語尾は使わない
 ・スマートで知性的な口調を保ちつつ、押しつけがましくない
 ・絵文字は使わない
 ・AIが書いたような「〜が重要です」「〜を推進します」などの硬い表現は避ける
 
 【投稿の構成】
-1. 名言・引用を日本語で紹介（「〇〇の言葉：」などの書き出し）
-2. 改行して、林業経営・森林管理への応用コメントを1〜2文添える
-3. 改行して、ハッシュタグ
+1. 記事のテーマを自分の言葉で簡潔に言及（1文）
+2. 林業経営・森林・地域経済への応用・示唠を実務的に語る（1〜2文）
+3. 問いかけまたは自分の考えを一言添える（1文）
+4. ハッシュタグ
 
 【実際の投稿例（この文体を参考にすること）】
-「とても深い学びがある。
-問い続ける力を養う大切さがある。」
+「今日も生産森林組合さんとの山歩き。
+エリートツリーの成長も実感出来たようで良かったです。
+週末に山主さんとの山歩きをしていると、清々しいような、時間が無くなるような微妙な心境で新年度も精進していきます。」
 
-「学校とか公共施設に出始めないと、行政は動かない。
-里山整備もやりながら、同時に災害対策を進めていかないと状況が悪化する。」
+「学校や公共施設への木材活用が進まないと、行政はなかなか動きません。
+里山整備と災害対策、同時に進める必要があります。」
 
 【厳守事項】
 ・文字数は全体で140文字以内（ハッシュタグ・改行含む）
@@ -508,11 +580,11 @@ def generate_quote_tweet(quote_data):
 """
     
     user_content = f"""
-引用する人物: {quote_data['person']}（{quote_data['role']}）
-名言（日本語）: {quote_data['quote_ja']}
-林業経営への応用テーマ: {quote_data['theme']}
+記事タイトル: {article_title}
+記事の概要: {article_snippet[:200] if article_snippet else '（概要なし）'}
 
-上記の名言を引用し、林業経営に役立つコメントを加えた投稿を作成してください。
+上記の記事を読んで、林業経営者の視座から深みのある投稿を作成してください。
+記事のテーマを林業経営・森林管理・地域経済に結びつけ、実務的な洞察を加えてください。
 """
     
     try:
@@ -544,7 +616,7 @@ def generate_quote_tweet(quote_data):
         
         return enforce_linebreaks(tweet_text)
     except Exception as e:
-        logger.error(f"引用ツイート生成エラー: {e}")
+        logger.error(f"バズ記事洞察ツイート生成エラー: {e}")
         return None
 
 
@@ -625,13 +697,21 @@ def noon_job():
         post_to_x(tweet, article_url)
 
 def pre_evening_job():
-    """大20時の投稿（有名経営者・心理学者の引用＋林業経営コメント）"""
-    logger.info("=== 大20時 引用・経営論ジョブ開始 ===")
-    quote_data = random.choice(QUOTES)
-    logger.info(f"引用する人物: {quote_data['person']}")
-    tweet = generate_quote_tweet(quote_data)
-    # 引用元人物の関連記事を検索してURLを取得
-    _, article_url = fetch_forestry_news(f"{quote_data['person']} {quote_data['theme'][:20]}")
+    """夜20時の投稿（その日のバズ記事を引用し、林業経営者の視座で深みのある投稿）"""
+    logger.info("=== 夜20時 バズ記事引用・林業経営者視座ジョブ開始 ===")
+    title, snippet, article_url = fetch_todays_buzz_article()
+    if title:
+        logger.info(f"取得記事: {title}")
+        tweet = generate_buzz_insight_tweet(title, snippet)
+    else:
+        # 記事取得失敗時は汎用テーマで投稿
+        logger.warning("バズ記事取得失敗。汎用テーマで投稿します。")
+        fallback_topics = [
+            ("地方経済", "地方の人口減少と産業機械化による地域経済の再生"),
+            ("経営論", "不確実性の高い時代における林業経営の意思決定とリスク管理"),
+        ]
+        category, topic = random.choice(fallback_topics)
+        tweet = generate_tweet(category, topic)
     if tweet:
         post_to_x(tweet, article_url)
 
@@ -669,7 +749,7 @@ def setup_scheduler():
     logger.info("  朝6時 JST (UTC 21:00): 海外バズ記事紹介")
     logger.info("  朝7時 JST (UTC 22:00): 国内政策・ニュース")
     logger.info("  昼12時 JST (UTC 03:00): 木材市況・テクノロジー")
-    logger.info("  夜20時 JST (UTC 11:00): 有名人引用・経営論")
+    logger.info("  夜20時 JST (UTC 11:00): その日のバズ記事引用・林業経営者視座")
     logger.info("  夜21時 JST (UTC 12:00): 海外トレンド・研究情報")
 
 def run_scheduler():
@@ -713,7 +793,7 @@ if __name__ == "__main__":
         logger.info("=== 昼12時枠 木材市況・テクノロジー 投稿 ===")
         noon_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "20:00":
-        logger.info("=== 夜20時枠 有名人引用・経営論 投稿 ===")
+        logger.info("=== 夜20時渠 バズ記事引用・林業経営者視座 投稿 ===")
         pre_evening_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "21:00":
         logger.info("=== 夜21時枠 海外トレンド・研究情報 投稿 ===")
