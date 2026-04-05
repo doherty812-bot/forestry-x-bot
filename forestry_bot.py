@@ -623,26 +623,44 @@ def generate_buzz_insight_tweet(article_title, article_snippet):
 # =========================================================
 # X投稿
 # =========================================================
+HASHTAGS = "#林業 #forest"
+
 def post_to_x(tweet_text, article_url=None):
     """
     Xにツイートを投稿する。
-    article_urlが指定された場合、本文末尾に記事URLを付ける。
-    X上でURLは23文字としてカウントされるため、本文は117文字以内に制限する。
+    - 本文の末尾に必ず HASHTAGS（#林業 #forest）を付ける
+    - article_urlがある場合はさらにURLを付ける
+    - X上でURLは23文字としてカウントされるため、本文はそれを考慵して制限する
     """
     if not tweet_text:
         logger.error("投稿テキストが空です")
         return False
-    
-    # URLを付ける場合は本文を117文字以内に収める（URLは23文字としてカウント）
+
+    # GPTが生成した本文からハッシュタグを除去してクリーンな本文だけ取り出す
+    # (ハッシュタグは必ず HASHTAGS で上書きするため)
+    import re
+    clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
+
+    # ハッシュタグは固定: "#林業 #forest"
+    hashtag_str = HASHTAGS  # 9文字
+
     if article_url:
-        # 本文が117文字を超える場合は切り詰める
-        body = tweet_text
-        if len(body) > 117:
-            body = body[:116] + "…"
-        full_text = f"{body}\n{article_url}"
+        # URLは23文字扱い。改行・ハッシュタグ・URLの分を引いた予算を計算
+        # 構成: {clean_body}\n{hashtag_str}\n{url}
+        # 予算: 140 - len(hashtag_str) - 2(改行2回) - 23(URL) = 140 - 9 - 2 - 23 = 106文字
+        # 改行は1文字扱いなので: 140 - 9(hashtag) - 2(\n x 2) - 23(URL) = 106
+        max_body = 104  # 少し余裕を持たせて140内に収める
+        if len(clean_body) > max_body:
+            clean_body = clean_body[:max_body - 1] + "…"
+        full_text = f"{clean_body}\n{hashtag_str}\n{article_url}"
         logger.info(f"記事URL付き投稿: {article_url}")
     else:
-        full_text = tweet_text
+        # URLなしの場合: {clean_body}\n{hashtag_str}
+        # 予算: 140 - len(hashtag_str) - 1(改行) = 140 - 9 - 1 = 130文字
+        max_body = 130
+        if len(clean_body) > max_body:
+            clean_body = clean_body[:max_body - 1] + "…"
+        full_text = f"{clean_body}\n{hashtag_str}"
     
     try:
         client = tweepy.Client(
