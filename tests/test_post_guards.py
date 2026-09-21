@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""実投稿を伴わないガード・整形のユニットテスト。"""
+"""実投稿を伴わないガード・整形・コンテンツ方針のユニットテスト。"""
 
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import forestry_bot as bot
 
@@ -88,6 +88,94 @@ class TestNoonJobFailHard(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bot.noon_job()
             mock_post.assert_not_called()
+
+    def test_uses_domestic_insight_generator(self):
+        with patch.object(bot, "fetch_forestry_news", return_value=("国産材の動向", "https://example.com/noon")), \
+             patch.object(bot, "generate_buzz_insight_tweet", return_value="昼の本文です。") as mock_gen, \
+             patch.object(bot, "generate_industry_trend_tweet") as mock_industry, \
+             patch.object(bot, "post_to_x", return_value=True):
+            bot.noon_job()
+            mock_gen.assert_called_once()
+            mock_industry.assert_not_called()
+
+
+class TestIndustryTrendPolicy(unittest.TestCase):
+    """夜20時は産業・経営トレンド方針（国内農林業固定にしない）。"""
+
+    def test_primary_queries_are_not_forestry_only(self):
+        self.assertTrue(bot.INDUSTRY_TREND_QUERIES)
+        banned = ("林業", "林野庁", "国産材", "里山", "山林", "木材", "森林")
+        for q in bot.INDUSTRY_TREND_QUERIES:
+            for marker in banned:
+                self.assertNotIn(marker, q, msg=f"農林業固定クエリが混入: {q}")
+            self.assertTrue(
+                any(
+                    k in q
+                    for k in (
+                        "経営",
+                        "産業",
+                        "企業",
+                        "DX",
+                        "AI",
+                        "物流",
+                        "ESG",
+                        "人手不足",
+                        "価格",
+                        "投資",
+                        "働き方",
+                        "設備",
+                        "サプライ",
+                        "カーボン",
+                        "製造",
+                        "地方経済",
+                    )
+                ),
+                msg=f"産業・経営トレンドに見えないクエリ: {q}",
+            )
+
+    def test_fallback_queries_are_not_forestry_news(self):
+        for q in bot.INDUSTRY_TREND_FALLBACK_QUERIES:
+            self.assertNotIn("林業", q)
+            self.assertNotIn("国産材", q)
+            self.assertNotIn("林野庁", q)
+
+    def test_system_prompt_requires_forestry_insight_from_industry(self):
+        prompt = bot.INDUSTRY_TREND_SYSTEM_PROMPT
+        self.assertIn("産業・経営", prompt)
+        self.assertIn("林業経営への示唆", prompt)
+        self.assertIn("国内農林業ニュースの単なる紹介", prompt)
+
+    def test_pre_evening_uses_industry_generator(self):
+        with patch.object(
+            bot,
+            "fetch_todays_buzz_article",
+            return_value=("中小企業のDXが進む", "生産性の話", "https://example.com/biz"),
+        ), patch.object(
+            bot, "generate_industry_trend_tweet", return_value="示唆付き本文です。"
+        ) as mock_industry, patch.object(
+            bot, "generate_buzz_insight_tweet"
+        ) as mock_domestic, patch.object(bot, "post_to_x", return_value=True):
+            bot.pre_evening_job()
+            mock_industry.assert_called_once_with("中小企業のDXが進む", "生産性の話")
+            mock_domestic.assert_not_called()
+
+    def test_pre_evening_fallback_stays_on_industry_queries(self):
+        with patch.object(bot, "fetch_todays_buzz_article", return_value=(None, None, None)), \
+             patch.object(
+                 bot,
+                 "fetch_forestry_news",
+                 side_effect=[
+                     ("", None),
+                     ("人手不足と自動化", "https://example.com/fb"),
+                 ],
+             ) as mock_fetch, \
+             patch.object(bot, "generate_industry_trend_tweet", return_value="代替本文です。") as mock_gen, \
+             patch.object(bot, "post_to_x", return_value=True):
+            bot.pre_evening_job()
+            used_queries = [call.args[0] for call in mock_fetch.call_args_list]
+            for q in used_queries:
+                self.assertIn(q, bot.INDUSTRY_TREND_FALLBACK_QUERIES)
+            mock_gen.assert_called_once()
 
 
 if __name__ == "__main__":
