@@ -6,7 +6,11 @@
 
 時間帯別コンテンツ:
   昼12時 : 国内農林業ニュース × 実務コメント（Google News RSS取得）
-  夜20時 : 産業・経営トレンド × 林業への洞察（幅広い分野のバズ記事引用）
+  夜20時 : 現行は国内農林業ニュース引用 × 現場視座
+           （再開前に「産業・経営トレンド」へ戻すか所有者確認が必要）
+
+認証情報は環境変数必須。実投稿CLIは CONFIRM_LIVE_POST=1 が必要。
+詳細は README.md / CURSOR_HANDOVER.md を参照。
 """
 
 import os
@@ -30,18 +34,58 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-# API Keys（環境変数から読み込む。GitHub Secretsに設定すること）
-X_API_KEY = os.environ.get("X_API_KEY", "Xp21RzHbvodbQ6LjVO3dGkaSo")
-X_API_SECRET = os.environ.get("X_API_SECRET", "MdjTOgQ8zcBGkqCJx4CXFYNObCpavM3gYLXexijuFBFDYWvPwU")
-X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN", "76645169-Bz154QH6XqMeVTFl1umbsdQ966VjGoh01mNIVAX0c")
-X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "UYP6q8gdcgGExYvU1jz4jS14die2GPoiEih6udY46FDjD")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
-# OpenAI クライアント初期化
-if OPENAI_BASE_URL:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-else:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# API Keys（環境変数必須。既定値は持たない。GitHub Secrets / .env のみで供給）
+REQUIRED_X_ENV_VARS = (
+    "X_API_KEY",
+    "X_API_SECRET",
+    "X_ACCESS_TOKEN",
+    "X_ACCESS_TOKEN_SECRET",
+)
+
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"必須環境変数 {name} が未設定です")
+    return value
+
+
+def get_x_credentials():
+    """X API OAuth 1.0a 認証情報を環境変数から取得する。"""
+    return {
+        "consumer_key": _require_env("X_API_KEY"),
+        "consumer_secret": _require_env("X_API_SECRET"),
+        "access_token": _require_env("X_ACCESS_TOKEN"),
+        "access_token_secret": _require_env("X_ACCESS_TOKEN_SECRET"),
+    }
+
+
+_openai_client = None
+
+
+def get_openai_client():
+    """OpenAI クライアントを遅延初期化する。"""
+    global _openai_client
+    if _openai_client is None:
+        api_key = _require_env("OPENAI_API_KEY")
+        base_url = os.environ.get("OPENAI_BASE_URL") or None
+        if base_url:
+            _openai_client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
+
+
+def require_live_post_confirmation():
+    """
+    実投稿CLIを誤実行しないためのガード。
+    CONFIRM_LIVE_POST=1 のときのみ実投稿モードを許可する。
+    """
+    if os.environ.get("CONFIRM_LIVE_POST") != "1":
+        raise RuntimeError(
+            "実投稿モードは無効です。"
+            "意図した実投稿の場合のみ CONFIRM_LIVE_POST=1 を設定してください。"
+        )
 
 # =========================================================
 # 改行後処理：句点の後に必ず改行を入れる
@@ -423,7 +467,8 @@ def generate_tweet(category, topic, news_context=""):
         user_content += f"\n参考情報: {news_context[:300]}"
     
     try:
-        response = openai_client.chat.completions.create(
+        client = get_openai_client()
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -436,7 +481,7 @@ def generate_tweet(category, topic, news_context=""):
         
         # 140文字チェック
         if len(tweet_text) > 140:
-            retry_response = openai_client.chat.completions.create(
+            retry_response = client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -512,7 +557,8 @@ def generate_global_buzz_tweet(query, articles):
 """
     
     try:
-        response = openai_client.chat.completions.create(
+        client = get_openai_client()
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -525,7 +571,7 @@ def generate_global_buzz_tweet(query, articles):
         
         # 140文字チェック
         if len(tweet_text) > 140:
-            retry_response = openai_client.chat.completions.create(
+            retry_response = client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -604,7 +650,8 @@ def generate_buzz_insight_tweet(article_title, article_snippet):
 """
     
     try:
-        response = openai_client.chat.completions.create(
+        client = get_openai_client()
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -617,7 +664,7 @@ def generate_buzz_insight_tweet(article_title, article_snippet):
         
         # 140文字チェック
         if len(tweet_text) > 140:
-            retry_response = openai_client.chat.completions.create(
+            retry_response = client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -641,49 +688,54 @@ def generate_buzz_insight_tweet(article_title, article_snippet):
 # =========================================================
 HASHTAGS = "#林業 #forest"
 
+def build_tweet_payload(tweet_text, article_url=None):
+    """
+    投稿本文を組み立てる（副作用なし）。
+    戻り値: (full_text, clean_body) またはエラー時は ValueError。
+    """
+    if not tweet_text:
+        raise ValueError("投稿テキストが空です")
+
+    import re
+    clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
+    hashtag_str = HASHTAGS
+
+    if article_url:
+        max_body = 104
+        if len(clean_body) > max_body:
+            clean_body = clean_body[:max_body - 1] + "…"
+        full_text = f"{clean_body}\n{hashtag_str}\n{article_url}"
+    else:
+        max_body = 130
+        if len(clean_body) > max_body:
+            clean_body = clean_body[:max_body - 1] + "…"
+        full_text = f"{clean_body}\n{hashtag_str}"
+    return full_text, clean_body
+
+
 def post_to_x(tweet_text, article_url=None):
     """
     Xにツイートを投稿する。
     - 本文の末尾に必ず HASHTAGS（#林業 #forest）を付ける
     - article_urlがある場合はさらにURLを付ける
-    - X上でURLは23文字としてカウントされるため、本文はそれを考慵して制限する
+    - X上でURLは23文字としてカウントされるため、本文はそれを考慮して制限する
     """
-    if not tweet_text:
-        logger.error("投稿テキストが空です")
+    try:
+        full_text, _ = build_tweet_payload(tweet_text, article_url)
+    except ValueError as e:
+        logger.error(str(e))
         return False
 
-    # GPTが生成した本文からハッシュタグを除去してクリーンな本文だけ取り出す
-    # (ハッシュタグは必ず HASHTAGS で上書きするため)
-    import re
-    clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
-
-    # ハッシュタグは固定: "#林業 #forest"
-    hashtag_str = HASHTAGS  # 9文字
-
     if article_url:
-        # URLは23文字扱い。改行・ハッシュタグ・URLの分を引いた予算を計算
-        # 構成: {clean_body}\n{hashtag_str}\n{url}
-        # 予算: 140 - len(hashtag_str) - 2(改行2回) - 23(URL) = 140 - 9 - 2 - 23 = 106文字
-        # 改行は1文字扱いなので: 140 - 9(hashtag) - 2(\n x 2) - 23(URL) = 106
-        max_body = 104  # 少し余裕を持たせて140内に収める
-        if len(clean_body) > max_body:
-            clean_body = clean_body[:max_body - 1] + "…"
-        full_text = f"{clean_body}\n{hashtag_str}\n{article_url}"
         logger.info(f"記事URL付き投稿: {article_url}")
-    else:
-        # URLなしの場合: {clean_body}\n{hashtag_str}
-        # 予算: 140 - len(hashtag_str) - 1(改行) = 140 - 9 - 1 = 130文字
-        max_body = 130
-        if len(clean_body) > max_body:
-            clean_body = clean_body[:max_body - 1] + "…"
-        full_text = f"{clean_body}\n{hashtag_str}"
-    
+
     try:
+        creds = get_x_credentials()
         client = tweepy.Client(
-            consumer_key=X_API_KEY,
-            consumer_secret=X_API_SECRET,
-            access_token=X_ACCESS_TOKEN,
-            access_token_secret=X_ACCESS_TOKEN_SECRET
+            consumer_key=creds["consumer_key"],
+            consumer_secret=creds["consumer_secret"],
+            access_token=creds["access_token"],
+            access_token_secret=creds["access_token_secret"],
         )
         response = client.create_tweet(text=full_text)
         tweet_id = response.data['id']
@@ -696,35 +748,41 @@ def post_to_x(tweet_text, article_url=None):
         return False
 
 
+def ensure_post_ready(tweet, article_url):
+    """URL・本文・投稿成否を検査し、失敗時は RuntimeError を送出する。"""
+    if not article_url:
+        raise RuntimeError("記事URLが取得できないため投稿を中止しました")
+    if not tweet:
+        raise RuntimeError("投稿文を生成できませんでした")
+    if not post_to_x(tweet, article_url):
+        raise RuntimeError("Xへの投稿に失敗しました")
+
+
 # =========================================================
 # 時間帯別ジョブ
 # =========================================================
 
 def early_morning_job():
-    """朝6時の投稿（海外の森林関連バズ記事を日本語で紹介）"""
+    """朝6時の投稿（海外の森林関連バズ記事を日本語で紹介）※現行定期枠外・互換用"""
     logger.info("=== 朝6時 海外バズ記事紹介ジョブ開始 ===")
     query, articles = fetch_global_forest_buzz()
     tweet = generate_global_buzz_tweet(query, articles)
-    # 最初の記事URLを取得
     article_url = None
     if articles:
         article_url = articles[0].get('url')
-    if tweet:
-        post_to_x(tweet, article_url)
+    ensure_post_ready(tweet, article_url)
 
 def morning_job():
-    """朝7時の投稿（国内政策・ニュース系）"""
+    """朝7時の投稿（国内政策・ニュース系）※現行定期枠外・互換用"""
     logger.info("=== 朝7時 国内政策ジョブ開始 ===")
     category, topic = random.choice(MORNING_TOPICS)
     news, article_url = fetch_forestry_news(f"林業 {topic[:20]} 2025 2026")
     tweet = generate_tweet(category, topic, news)
-    if tweet:
-        post_to_x(tweet, article_url)
+    ensure_post_ready(tweet, article_url)
 
 def noon_job():
     """昼12時の投稿（国内農林業ニュース×実務コメント）"""
     logger.info("=== 昼12時 国内農林業ニュース×実務コメント ジョブ開始 ===")
-    # Google News RSSから国内農林業系ニュースを取得
     buzz_queries = [
         "林業 国内 最新",
         "木材 市場 国産材",
@@ -740,13 +798,12 @@ def noon_job():
     query = random.choice(buzz_queries)
     logger.info(f"昼12時 国内農林業ニュース検索クエリ: {query}")
     news, article_url = fetch_forestry_news(query)
-    # generate_buzz_insight_tweetを流用して実務コメント付き投稿を生成
     if news:
         tweet = generate_buzz_insight_tweet(query, news)
     else:
-        # ニュース取得失敗時：別クエリで再試行してURLを必ず取得する
         logger.warning("ニューススニペットなし。別クエリで再取得します。")
         fallback_queries = ["林業 最新", "国産材 活用", "木材 市場"]
+        tweet = None
         for fq in fallback_queries:
             news2, url2 = fetch_forestry_news(fq, retry=False)
             if news2 and url2:
@@ -754,18 +811,21 @@ def noon_job():
                 break
         category, topic = random.choice(NOON_TOPICS)
         tweet = generate_tweet(category, topic, news)
-    if tweet:
-        post_to_x(tweet, article_url)
+    ensure_post_ready(tweet, article_url)
 
 def pre_evening_job():
-    """夜20時の投稿（その日のバズ記事を引用し、林業経営者の視座で深みのある投稿）"""
-    logger.info("=== 夜20時 バズ記事引用・林業経営者視座ジョブ開始 ===")
+    """
+    夜20時の投稿。
+    現行実装は国内農林業ニュース引用＋現場コメント。
+    再開前に「国内農林業」固定か「産業・経営トレンド」へ戻すかを所有者確認すること。
+    """
+    logger.info("=== 夜20時 国内農林業ニュース引用・林業経営者視座ジョブ開始 ===")
     title, snippet, article_url = fetch_todays_buzz_article()
+    tweet = None
     if title:
         logger.info(f"取得記事: {title}")
         tweet = generate_buzz_insight_tweet(title, snippet)
     else:
-        # 記事取得失敗時：国内農林業ニュースからURLを必ず取得する
         logger.warning("バズ記事取得失敗。国内林業ニュースで代替します。")
         fallback_queries = ["林業 国内 最新", "木材 市場 国産材", "森林 整備 政策"]
         for fq in fallback_queries:
@@ -775,55 +835,37 @@ def pre_evening_job():
                 tweet = generate_buzz_insight_tweet(fq, news2)
                 break
         else:
-            # 全クエリ失敗時の最終フォールバック
-            fallback_topics = [
-                ("地方経済", "地方の人口減少と産業機械化による地域経済の再生"),
-                ("経営論", "不確実性の高い時代における林業経営の意思決定とリスク管理"),
-            ]
-            category, topic = random.choice(fallback_topics)
-            tweet = generate_tweet(category, topic)
-    if tweet:
-        post_to_x(tweet, article_url)
+            raise RuntimeError("記事URLが取得できないため投稿を中止しました")
+    ensure_post_ready(tweet, article_url)
 
 def evening_job():
-    """大21時の投稿（海外トレンド・研究情報系）"""
-    logger.info("=== 大21時 海外トレンド・研究情報ジョブ開始 ===")
+    """夜21時の投稿（海外トレンド・研究情報系）※現行定期枠外・互換用"""
+    logger.info("=== 夜21時 海外トレンド・研究情報ジョブ開始 ===")
     category, topic = random.choice(EVENING_TOPICS)
     if category == "海外トレンド":
         news, article_url = fetch_forestry_news("forest forestry trend 2025 2026")
     else:
         news, article_url = fetch_forestry_news(f"森林総合研究所 {topic[:15]}")
     tweet = generate_tweet(category, topic, news)
-    if tweet:
-        post_to_x(tweet, article_url)
+    ensure_post_ready(tweet, article_url)
 
 
 # =========================================================
-# スケジューラー設定
+# スケジューラー設定（ローカル常駐用・GitHub Actionsでは未使用）
 # =========================================================
 def setup_scheduler():
-    """スケジュールを設定する（JST基準）"""
-    # サーバーはUTC。JSTはUTC+9。
-    # 朝6:00 JST = 前日21:00 UTC
-    # 朝7:00 JST = 前日22:00 UTC
-    # 昼12:00 JST = 03:00 UTC
-    # 夜20:00 JST = 11:00 UTC
-    # 夜21:00 JST = 12:00 UTC
-    schedule.every().day.at("21:00").do(early_morning_job)  # 朝6時 JST
-    schedule.every().day.at("22:00").do(morning_job)         # 朝7時 JST
+    """スケジュールを設定する（JST基準）。本番定期実行はGitHub Actions側。"""
+    # 現行の本番枠は昼12時・夜20時のみ。以下は互換・ローカル検証用。
     schedule.every().day.at("03:00").do(noon_job)            # 昼12時 JST
     schedule.every().day.at("11:00").do(pre_evening_job)     # 夜20時 JST
-    schedule.every().day.at("12:00").do(evening_job)         # 夜21時 JST
-    
-    logger.info("スケジューラー設定完了（1日5回投稿）")
-    logger.info("  朝6時 JST (UTC 21:00): 海外バズ記事紹介")
-    logger.info("  朝7時 JST (UTC 22:00): 国内政策・ニュース")
-    logger.info("  昼12時 JST (UTC 03:00): 木材市況・テクノロジー")
-    logger.info("  夜20時 JST (UTC 11:00): その日のバズ記事引用・林業経営者視座")
-    logger.info("  夜21時 JST (UTC 12:00): 海外トレンド・研究情報")
+
+    logger.info("スケジューラー設定完了（本番2枠: 12:00 / 20:00 JST）")
+    logger.info("  昼12時 JST (UTC 03:00): 国内農林業ニュース×実務コメント")
+    logger.info("  夜20時 JST (UTC 11:00): 国内農林業ニュース引用・現場視座")
 
 def run_scheduler():
-    """スケジューラーを実行する"""
+    """スケジューラーを実行する（CONFIRM_LIVE_POST=1 必須）"""
+    require_live_post_confirmation()
     setup_scheduler()
     logger.info("自動投稿ボット起動。次の投稿時刻を待機中...")
     while True:
@@ -836,64 +878,47 @@ def run_scheduler():
 # =========================================================
 if __name__ == "__main__":
     import sys
-    
+
+    LIVE_POST_ARGS = {"test_all", "test", "test_quote", "12:00", "20:00", "run"}
+
+    if len(sys.argv) > 1 and sys.argv[1] in LIVE_POST_ARGS:
+        require_live_post_confirmation()
+
     if len(sys.argv) > 1 and sys.argv[1] == "test_all":
-        # 全ジョブをテスト実行（実際に投稿）
-        logger.info("=== 全ジョブ テストモード実行 ===")
+        logger.info("=== 全ジョブ テストモード実行（実投稿）===")
         early_morning_job()
         morning_job()
         noon_job()
         pre_evening_job()
         evening_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "test":
-        # 朝6時ジョブのみテスト
-        logger.info("=== テストモード実行（朝6時ジョブ）===")
+        logger.info("=== テストモード実行（朝6時ジョブ・実投稿）===")
         early_morning_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "test_quote":
-        # 夜20時ジョブのみテスト
-        logger.info("=== テストモード実行（夜20時ジョブ）===")
+        logger.info("=== テストモード実行（夜20時ジョブ・実投稿）===")
         pre_evening_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "12:00":
         logger.info("=== 昼12時枠 国内農林業ニュース×実務コメント 投稿 ===")
         noon_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "20:00":
-        logger.info("=== 夜20時枠 産業・経営トレンド×林業への洞察 投稿 ===")
+        logger.info("=== 夜20時枠 国内農林業ニュース引用 投稿 ===")
         pre_evening_job()
     elif len(sys.argv) > 1 and sys.argv[1] == "run":
-        # 本番モード: スケジューラー起動
         run_scheduler()
+    elif len(sys.argv) > 1 and sys.argv[1] == "dry-run-format":
+        # 実投稿なし: 本文組み立てのみ検証
+        sample = "山を経営資源として見る視点が大切です。\n現場の感覚も忘れません。"
+        url = "https://news.google.com/articles/example"
+        full, _ = build_tweet_payload(sample, url)
+        logger.info(f"dry-run payload:\n{full}")
+        assert HASHTAGS in full
+        assert url in full
+        logger.info("dry-run-format OK")
     else:
-        # デフォルト: 全時間帯のサンプルツイートを生成のみ（投稿なし）
-        logger.info("=== サンプルツイート生成テスト（投稿なし）===")
-        
-        # 朝6時: 海外バズ記事
-        logger.info("[朝6時] 海外バズ記事紹介サンプル生成中...")
-        query, articles = fetch_global_forest_buzz()
-        tweet = generate_global_buzz_tweet(query, articles)
-        logger.info(f"  生成ツイート ({len(tweet) if tweet else 0}文字): {tweet}")
-        logger.info("")
-        
-        # 朝7時: 国内政策
-        category, topic = random.choice(MORNING_TOPICS)
-        tweet = generate_tweet(category, topic)
-        logger.info(f"[朝7時] 国内政策サンプル ({len(tweet) if tweet else 0}文字): {tweet}")
-        logger.info("")
-        
-        # 昼12時: 木材市況・テクノロジー
-        category, topic = random.choice(NOON_TOPICS)
-        tweet = generate_tweet(category, topic)
-        logger.info(f"[昼12時] 木材市況・テクノロジーサンプル ({len(tweet) if tweet else 0}文字): {tweet}")
-        logger.info("")
-        
-        # 夜20時: 有名人引用
-        logger.info("[夜20時] 有名人引用・経営論サンプル生成中...")
-        quote_data = random.choice(QUOTES)
-        tweet = generate_quote_tweet(quote_data)
-        logger.info(f"  引用: {quote_data['person']}「{quote_data['quote_ja']}」")
-        logger.info(f"  生成ツイート ({len(tweet) if tweet else 0}文字): {tweet}")
-        logger.info("")
-        
-        # 夜21時: 海外トレンド・研究情報
-        category, topic = random.choice(EVENING_TOPICS)
-        tweet = generate_tweet(category, topic)
-        logger.info(f"[夜21時] 海外トレンド・研究情報サンプル ({len(tweet) if tweet else 0}文字): {tweet}")
+        logger.info(
+            "実投稿なしの既定モードです。"
+            "利用: dry-run-format | CONFIRM_LIVE_POST=1 付きで 12:00 / 20:00 / run など"
+        )
+        sample = "国産材の需要を現場で感じています。\n価格交渉の季節でもあります。"
+        full, _ = build_tweet_payload(sample, "https://example.com/news")
+        logger.info(f"サンプル組み立て ({len(full)}文字):\n{full}")
