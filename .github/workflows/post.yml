@@ -1,17 +1,19 @@
 name: 林業X自動投稿
 
+# 引継ぎ中は workflow 自体を GitHub UI で Disable 済みであること。
+# 再開までは schedule を置かず、手動 workflow_dispatch のみ残す。
 on:
-  schedule:
-    # 昼12時 JST = UTC 03:00
-    - cron: '0 3 * * *'
-    # 夜20時 JST = UTC 11:00
-    - cron: '0 11 * * *'
   workflow_dispatch:
     inputs:
       slot:
         description: '投稿スロット（12:00 / 20:00）'
         required: false
         default: ''
+      confirm_live_post:
+        description: '実投稿する場合は true（CONFIRM_LIVE_POST=1）'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   post:
@@ -27,7 +29,7 @@ jobs:
 
       - name: 依存パッケージをインストール
         run: |
-          pip install tweepy openai requests beautifulsoup4 schedule
+          pip install -r requirements.txt
 
       - name: 投稿スロットを判定して実行
         env:
@@ -37,12 +39,17 @@ jobs:
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CONFIRM_LIVE_POST: ${{ inputs.confirm_live_post && '1' || '0' }}
         run: |
+          if [ "${CONFIRM_LIVE_POST}" != "1" ]; then
+            echo "実投稿が無効です。confirm_live_post=true で再実行してください。"
+            exit 1
+          fi
           # 手動実行でスロット指定がある場合はそれを使う
           if [ -n "${{ github.event.inputs.slot }}" ]; then
             SLOT="${{ github.event.inputs.slot }}"
           else
-            # UTC時刻からJSTスロットを判定
+            # UTC時刻からJSTスロットを判定（再開後の schedule 復帰用ロジック）
             UTC_HOUR=$(date -u +%H)
             case $UTC_HOUR in
               03) SLOT="12:00" ;;
@@ -51,4 +58,4 @@ jobs:
             esac
           fi
           echo "実行スロット: $SLOT"
-          python forestry_bot.py $SLOT
+          python forestry_bot.py "$SLOT"
