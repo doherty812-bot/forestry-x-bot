@@ -1,28 +1,23 @@
-name: 林業X自動投稿
+name: 林業X下書き生成
 
-# 定期投稿は再開済み（cron 下記）。
-# ※ GitHub UI で workflow が Disable のままだと cron も手動も動かない。
-#    再開後は Actions →「林業X自動投稿」→ Enable workflow が別途必要。
+# 人間承認制: schedule / 手動とも「下書き生成のみ」。X には投稿しない。
+# 投稿はローカル/Cursor で CONFIRM_LIVE_POST=1 python forestry_bot.py approve ... のみ。
+# Enable 済みでも誤爆しないよう、この workflow に X_* Secrets を渡さない。
 on:
   schedule:
-    # 昼12時 JST = UTC 03:00
+    # 昼12時 JST = UTC 03:00 — 下書き生成
     - cron: '0 3 * * *'
-    # 夜20時 JST = UTC 11:00
+    # 夜20時 JST = UTC 11:00 — 下書き生成
     - cron: '0 11 * * *'
   workflow_dispatch:
     inputs:
       slot:
-        description: '投稿スロット（12:00 / 20:00）'
+        description: '下書きスロット（12:00 / 20:00）'
         required: false
-        default: ''
-      confirm_live_post:
-        description: '実投稿する場合は true（CONFIRM_LIVE_POST=1）'
-        required: true
-        type: boolean
-        default: false
+        default: '12:00'
 
 jobs:
-  post:
+  draft:
     runs-on: ubuntu-latest
     steps:
       - name: リポジトリをチェックアウト
@@ -37,28 +32,18 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: 投稿スロットを判定して実行
+      - name: 下書きを生成（投稿しない）
         env:
-          X_API_KEY: ${{ secrets.X_API_KEY }}
-          X_API_SECRET: ${{ secrets.X_API_SECRET }}
-          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
-          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          # schedule は承認済み定期実行のため自動許可。手動は confirm_live_post=true が必要。
-          CONFIRM_LIVE_POST: ${{ github.event_name == 'schedule' && '1' || (inputs.confirm_live_post && '1' || '0') }}
-          EVENT_NAME: ${{ github.event_name }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          GROK_MODEL: ${{ secrets.GROK_MODEL }}
         run: |
-          if [ "${CONFIRM_LIVE_POST}" != "1" ]; then
-            echo "実投稿が無効です。手動実行時は confirm_live_post=true を指定してください。"
-            echo "（schedule 実行では自動で許可されます。event=${EVENT_NAME}）"
-            exit 1
-          fi
-          # 手動実行でスロット指定がある場合はそれを使う
           if [ -n "${{ github.event.inputs.slot }}" ]; then
             SLOT="${{ github.event.inputs.slot }}"
           else
-            # UTC時刻からJSTスロットを判定
             UTC_HOUR=$(date -u +%H)
             case $UTC_HOUR in
               03) SLOT="12:00" ;;
@@ -66,6 +51,12 @@ jobs:
               *) SLOT="12:00" ;;
             esac
           fi
-          echo "実行イベント: $EVENT_NAME"
-          echo "実行スロット: $SLOT"
-          python forestry_bot.py "$SLOT"
+          echo "下書きスロット: $SLOT（X投稿は行いません）"
+          python forestry_bot.py draft "$SLOT"
+
+      - name: 下書きアーティファクトを保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: forestry-drafts
+          path: drafts/*.json
+          if-no-files-found: warn
