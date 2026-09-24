@@ -7,8 +7,22 @@ __pycache__/
 .mypy_cache/
 .DS_Store
 *.log
-# Obsidian vault の実体はコミットしない（パス設定／ローカル同期で参照）
-obsidian/*
-!obsidian/.gitkeep
+
+# Obsidian（方法1）: 公開してよい .md のみ `obsidian/` にコミット可。
+# キャッシュ・ゴミ箱・明らかに危険なファイル名は除外。
+obsidian/.obsidian/
+obsidian/.trash/
+obsidian/**/.obsidian/
+obsidian/**/.trash/
+obsidian/**/secrets.md
+obsidian/**/credentials.md
+obsidian/**/*password*
+obsidian/**/*api-key*
+obsidian/**/*apikey*
+obsidian/**/*.key
+obsidian/**/*.pem
+obsidian/**/*.env
+
+# vault-sync はローカル／artifact マウント用（実ノートはコミットしない）
 vault-sync/*
 !vault-sync/.gitkeep

@@ -1,3 +1,2 @@
-# Optional checkout / artifact mount point for Obsidian notes.
-# Set OBSIDIAN_VAULT_PATH to this directory or your real vault path.
-# Do not commit private notes here.
+# Kept so empty checkouts still have this directory.
+# Public markdown notes and README.md live alongside this file (method 1).

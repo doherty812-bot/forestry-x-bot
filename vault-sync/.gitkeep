@@ -1,2 +1,3 @@
 # Optional Actions sync mount (same role as obsidian/).
-# Copy selected public notes here before draft runs; do not commit private notes.
+# Prefer committing public notes to ../obsidian/ (method 1).
+# This folder stays gitignored except this file; use for local/artifact mounts only.

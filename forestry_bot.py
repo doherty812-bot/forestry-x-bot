@@ -90,7 +90,7 @@ DEFAULT_OBSIDIAN_MAX_FILES = 8
 DEFAULT_OBSIDIAN_MAX_CHARS = 6000
 # ローカル Windows 既定（Actions の Linux ランナーでは存在しない → 次候補／警告へ）
 DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\Obsidian Vault"
-# Actions 向け: リポジトリ内の同期先（実ノートは gitignore。中身があれば最優先）
+# Actions 向け: リポジトリ内の同期先（方法1: 公開可 .md を obsidian/ にコミット。中身があれば最優先）
 REPO_OBSIDIAN_DIRS = ("obsidian", "vault-sync")
 
 # OpenAI / Grok 共通: 読者問いかけをやめ、一人称の意志を出す
@@ -207,7 +207,7 @@ def resolve_obsidian_vault_path():
 
 
 def _iter_obsidian_markdown(vault_root):
-    """vault 内の .md を新しい順で返す。.obsidian は除外。"""
+    """vault 内の .md を新しい順で返す。.obsidian / README.md は除外。"""
     from pathlib import Path
 
     root = Path(vault_root)
@@ -215,6 +215,9 @@ def _iter_obsidian_markdown(vault_root):
     for path in root.rglob("*.md"):
         parts = set(path.parts)
         if ".obsidian" in parts or ".trash" in parts:
+            continue
+        # 同期手順説明（obsidian/README.md 等）を下書きコンテキストに入れない
+        if path.name.lower() == "readme.md":
             continue
         try:
             mtime = path.stat().st_mtime
