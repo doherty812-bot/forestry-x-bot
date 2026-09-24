@@ -1,67 +1,47 @@
-# 林業X自動投稿ボット
+# 林業X投稿ボット（人間承認制）
 
-岸本一夫さんのXアカウント向けに、林業関連の投稿を自動生成・投稿するボットです。
+岸本一夫さんのX向け。**自動でXに投げません。** OpenAI と Grok で二系統の案を作り、所有者が選んだ案だけを投稿します。
 
-## 現状（定期投稿再開）
+## 設計（要約）
 
-- `post.yml` に cron 復帰済み（JST 12:00 / 20:00 = UTC `0 3 * * *` / `0 11 * * *`）
-- **GitHub UI で workflow を Enable しないと動かない**（Disable のままだと cron も無効）
-- 手動 `workflow_dispatch` は `confirm_live_post=true` が必要（schedule は自動許可）
-- ソースに X 認証の既定値は置かない（環境変数 / Secrets 必須）
-- 記事URL未取得・投稿失敗時は非ゼロ終了
+1. `draft 12:00|20:00` … 記事取得 → ChatGPT（OpenAI）案 + Grok 案を `drafts/` に保存（投稿しない）
+2. Cursor 等で両案を確認（ミスリード警告フラグも表示）
+3. `CONFIRM_LIVE_POST=1 python forestry_bot.py approve <id> openai|grok` … 選択した案のみ投稿
 
-## スタック
-
-| 項目 | 内容 |
-| --- | --- |
-| 実行 | GitHub Actions（Ubuntu / Python 3.11） |
-| 投稿 | Tweepy / X API v2 / OAuth 1.0a |
-| 生成 | OpenAI SDK（`gpt-4.1-mini`） |
-| 記事 | Google News RSS |
-| 本番枠 | JST 12:00 / 20:00（再開時に cron を戻す） |
+GitHub Actions の schedule も **下書き生成のみ**（X Secrets を渡さない）。
 
 ## 必要な環境変数
 
-`.env.example` と同名を GitHub Secrets に設定します。
-
-| 変数名 | 必須 | 説明 |
+| 変数名 | 必須 | 用途 |
 | --- | --- | --- |
-| `X_API_KEY` | Yes | X API Key |
-| `X_API_SECRET` | Yes | X API Secret |
-| `X_ACCESS_TOKEN` | Yes | Access Token |
-| `X_ACCESS_TOKEN_SECRET` | Yes | Access Token Secret |
-| `OPENAI_API_KEY` | Yes | OpenAI API Key |
-| `OPENAI_BASE_URL` | No | 互換エンドポイント用 |
-| `CONFIRM_LIVE_POST` | 実投稿時 | `1` のときのみ実投稿CLIを許可 |
-
-漏えいの可能性がある旧資格情報は **失効・再発行** してから Secrets を更新してください。値をコード・issue・チャットに書かないでください。
+| `OPENAI_API_KEY` | 下書き | ChatGPT 系生成 |
+| `XAI_API_KEY` または `GROK_API_KEY` | 下書き | Grok 生成（`XAI_API_KEY` 優先） |
+| `X_API_KEY` / `X_API_SECRET` / `X_ACCESS_TOKEN` / `X_ACCESS_TOKEN_SECRET` | 投稿時 | X API |
+| `OPENAI_BASE_URL` / `XAI_BASE_URL` | 任意 | 互換エンドポイント |
+| `OPENAI_MODEL` / `GROK_MODEL` | 任意 | モデル上書き |
+| `CONFIRM_LIVE_POST` | 投稿時 | `1` のときのみ `approve` 可 |
 
 ## ローカル
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # 値はローカルのみに記入
+cp .env.example .env   # 値はローカルのみ
 
-# 実投稿なし（本文組み立て）
-python forestry_bot.py dry-run-format
+python forestry_bot.py draft 12:00
+python forestry_bot.py list-drafts
+python forestry_bot.py show-draft <draft_id>
 
-# ユニットテスト（外部APIなし）
-python -m unittest discover -s tests -v
-```
-
-実投稿は所有者承認後のみ:
-
-```bash
+# 人間が選んだ案だけ投稿
 export CONFIRM_LIVE_POST=1
-# 必要な X_* / OPENAI_* を export したうえで
-python forestry_bot.py 12:00
+python forestry_bot.py approve <draft_id> openai   # または grok
+unset CONFIRM_LIVE_POST
 ```
+
+詳細: Project の `docs/dual-ai-approval-flow.md`
 
 ## コンテンツ枠
 
-- **12:00 JST**: 国内農林業ニュース × 現場実務コメント
-- **20:00 JST**: 産業・経営トレンド × 林業経営への示唆（国内農林業固定ではない）
+- **12:00**: 国内農林業ニュース × 現場コメント
+- **20:00**: 産業・経営トレンド × 林業への示唆
 
 固定タグ: `#林業 #forest`
