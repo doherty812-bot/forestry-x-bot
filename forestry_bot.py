@@ -73,10 +73,38 @@ def get_x_credentials():
 _openai_client = None
 _grok_client = None
 
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
-GROK_MODEL = os.environ.get("GROK_MODEL", "grok-3-mini")
-XAI_BASE_URL = os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1")
+# 未設定 Secrets が Actions で空文字 "" として渡ると get(..., default) が潰れるため、空は無視する
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_GROK_MODEL = "grok-3-mini"
+DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 VALID_PROVIDERS = ("openai", "grok")
+
+
+def env_or_default(name: str, default: str) -> str:
+    """環境変数が未設定・空白のときは default を使う。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    stripped = str(raw).strip()
+    return stripped if stripped else default
+
+
+def get_openai_model() -> str:
+    return env_or_default("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+
+def get_grok_model() -> str:
+    return env_or_default("GROK_MODEL", DEFAULT_GROK_MODEL)
+
+
+def get_xai_base_url() -> str:
+    return env_or_default("XAI_BASE_URL", DEFAULT_XAI_BASE_URL)
+
+
+# 後方互換: モジュール属性（テストや表示用）。実行時は get_*_model() を使う。
+OPENAI_MODEL = get_openai_model()
+GROK_MODEL = get_grok_model()
+XAI_BASE_URL = get_xai_base_url()
 
 
 def get_openai_client():
@@ -84,7 +112,8 @@ def get_openai_client():
     global _openai_client
     if _openai_client is None:
         api_key = _require_env("OPENAI_API_KEY")
-        base_url = os.environ.get("OPENAI_BASE_URL") or None
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        base_url = base_url.strip() if base_url and str(base_url).strip() else None
         if base_url:
             _openai_client = OpenAI(api_key=api_key, base_url=base_url)
         else:
@@ -94,7 +123,11 @@ def get_openai_client():
 
 def get_xai_api_key():
     """xAI / Grok 用キー。XAI_API_KEY を優先、なければ GROK_API_KEY。"""
-    return os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
+    for name in ("XAI_API_KEY", "GROK_API_KEY"):
+        raw = os.environ.get(name)
+        if raw and str(raw).strip():
+            return str(raw).strip()
+    return None
 
 
 def get_grok_client():
@@ -104,32 +137,48 @@ def get_grok_client():
         api_key = get_xai_api_key()
         if not api_key:
             raise RuntimeError("必須環境変数 XAI_API_KEY または GROK_API_KEY が未設定です")
-        _grok_client = OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+        _grok_client = OpenAI(api_key=api_key, base_url=get_xai_base_url())
     return _grok_client
 
 
 def get_client_and_model(provider: str):
     provider = (provider or "openai").lower()
     if provider == "openai":
-        return get_openai_client(), OPENAI_MODEL
+        model = get_openai_model()
+        if not model:
+            raise RuntimeError("OPENAI_MODEL が空です")
+        return get_openai_client(), model
     if provider == "grok":
-        return get_grok_client(), GROK_MODEL
+        model = get_grok_model()
+        if not model:
+            raise RuntimeError("GROK_MODEL が空です")
+        return get_grok_client(), model
     raise ValueError(f"未対応の provider: {provider}（openai / grok）")
 
 
 def chat_complete(provider: str, system_prompt: str, user_content: str, temperature: float = 0.75):
-    """指定プロバイダで chat completion を1回実行する。"""
+    """指定プロバイダで chat completion を1回実行する。失敗時は例外を送出。"""
     client, model = get_client_and_model(provider)
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        max_tokens=200,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content.strip()
+    logger.info(f"chat_complete provider={provider} model={model}")
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=200,
+            temperature=temperature,
+        )
+    except Exception as e:
+        raise RuntimeError(f"{provider} API呼び出し失敗 (model={model}): {e}") from e
+
+    if not response.choices:
+        raise RuntimeError(f"{provider} 応答に choices がありません (model={model})")
+    content = response.choices[0].message.content
+    if content is None or not str(content).strip():
+        raise RuntimeError(f"{provider} 応答本文が空です (model={model})")
+    return str(content).strip()
 
 
 def require_live_post_confirmation():
@@ -721,7 +770,7 @@ def generate_buzz_insight_tweet(article_title, article_snippet, provider="openai
         return enforce_linebreaks(tweet_text)
     except Exception as e:
         logger.error(f"国内農林業インサイトツイート生成エラー ({provider}): {e}")
-        return None
+        raise
 
 
 # =========================================================
@@ -793,7 +842,7 @@ def generate_industry_trend_tweet(article_title, article_snippet, provider="open
         return enforce_linebreaks(tweet_text)
     except Exception as e:
         logger.error(f"産業・経営トレンドツイート生成エラー ({provider}): {e}")
-        return None
+        raise
 
 
 # =========================================================
@@ -896,24 +945,31 @@ def print_draft_for_human(draft: dict):
 
 
 def build_dual_candidates(title: str, snippet: str, generator):
-    """同一ネタで openai / grok の案を作る。"""
+    """同一ネタで openai / grok の案を作る。失敗は error フィールドに残す。"""
     candidates = {}
     for provider in VALID_PROVIDERS:
+        model = get_openai_model() if provider == "openai" else get_grok_model()
         try:
             text = generator(title, snippet, provider=provider)
-            ok, flags = check_mislead_risk(text or "")
+            if not text or not str(text).strip():
+                raise RuntimeError(f"{provider} が空の本文を返しました (model={model})")
+            ok, flags = check_mislead_risk(text)
             candidates[provider] = {
                 "text": text,
                 "guard_ok": ok,
                 "flags": flags,
-                "model": OPENAI_MODEL if provider == "openai" else GROK_MODEL,
+                "model": model,
+                "error": None,
             }
         except Exception as e:
+            err = str(e)
+            logger.error(f"候補生成失敗 provider={provider} model={model}: {err}")
             candidates[provider] = {
                 "text": None,
                 "guard_ok": False,
                 "flags": ["generation_error"],
-                "error": str(e),
+                "model": model,
+                "error": err,
             }
     return candidates
 
@@ -922,11 +978,14 @@ def create_dual_draft(slot: str, title: str, snippet: str, article_url: str, gen
     if not article_url:
         raise RuntimeError("記事URLが取得できないため下書きを中止しました")
     candidates = build_dual_candidates(title, snippet or "", generator)
+    any_ok = any(
+        (c.get("text") and not c.get("error")) for c in candidates.values()
+    )
     draft = {
         "id": new_draft_id(slot),
         "slot": slot,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "pending",
+        "status": "pending" if any_ok else "failed",
         "article": {
             "title": title,
             "snippet": (snippet or "")[:500],
@@ -935,8 +994,14 @@ def create_dual_draft(slot: str, title: str, snippet: str, article_url: str, gen
         "candidates": candidates,
     }
     path = save_draft(draft)
-    logger.info(f"下書きを保存しました: {path}")
+    logger.info(f"下書きを保存しました: {path} status={draft['status']}")
     print_draft_for_human(draft)
+    if not any_ok:
+        errors = {p: (candidates[p] or {}).get("error") for p in VALID_PROVIDERS}
+        raise RuntimeError(
+            "OpenAI / Grok の両方が生成に失敗しました。"
+            f" details={errors}"
+        )
     return draft
 
 

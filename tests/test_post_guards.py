@@ -135,6 +135,48 @@ class TestIndustryTrendPolicy(unittest.TestCase):
         self.assertIn("ミスリード防止", bot.INDUSTRY_TREND_SYSTEM_PROMPT)
 
 
+class TestEnvModelDefaults(unittest.TestCase):
+    def test_empty_openai_model_secret_uses_default(self):
+        with patch.dict(os.environ, {"OPENAI_MODEL": "", "GROK_MODEL": "  "}):
+            self.assertEqual(bot.env_or_default("OPENAI_MODEL", "gpt-4.1-mini"), "gpt-4.1-mini")
+            self.assertEqual(bot.get_openai_model(), bot.DEFAULT_OPENAI_MODEL)
+            self.assertEqual(bot.get_grok_model(), bot.DEFAULT_GROK_MODEL)
+
+    def test_explicit_model_is_kept(self):
+        with patch.dict(os.environ, {"GROK_MODEL": "grok-4-fast"}):
+            self.assertEqual(bot.get_grok_model(), "grok-4-fast")
+
+
+class TestDualCandidateErrors(unittest.TestCase):
+    def test_errors_are_recorded_not_empty_text_only(self):
+        def boom(title, snippet, provider="openai"):
+            raise RuntimeError(f"{provider} API呼び出し失敗 (model=): missing")
+
+        cands = bot.build_dual_candidates("t", "s", boom)
+        for p in ("openai", "grok"):
+            self.assertIsNone(cands[p]["text"])
+            self.assertIn("generation_error", cands[p]["flags"])
+            self.assertTrue(cands[p]["error"])
+            self.assertNotIn("empty_text", cands[p]["flags"])
+
+    def test_both_fail_marks_draft_failed_and_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)):
+                def boom(title, snippet, provider="openai"):
+                    raise RuntimeError(f"{provider} down")
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    bot.create_dual_draft("12:00", "題", "概要", "https://ex.com", boom)
+                self.assertIn("両方", str(ctx.exception))
+                drafts = list(Path(tmp).glob("*.json"))
+                self.assertEqual(len(drafts), 1)
+                import json
+                data = json.loads(drafts[0].read_text(encoding="utf-8"))
+                self.assertEqual(data["status"], "failed")
+                self.assertTrue(data["candidates"]["openai"]["error"])
+                self.assertTrue(data["candidates"]["grok"]["error"])
+
+
 class TestCredentials(unittest.TestCase):
     def test_require_env_fails_without_defaults(self):
         env = os.environ.copy()
