@@ -4,11 +4,12 @@
 
 ## 設計（要約）
 
-1. `draft 12:00|20:00` … **複数ソース**取得 → ChatGPT + Grok 案を `drafts/` に保存（投稿しない）
-2. Cursor 等で両案を確認（ミスリード警告フラグも表示）
-3. `CONFIRM_LIVE_POST=1 python forestry_bot.py approve <id> openai|grok` … 選択した案のみ投稿
+1. Actions「林業X下書き生成」または `draft 12:00|20:00` … **複数ソース** → 二系統案（投稿しない）
+2. Cursor（**スマホアプリ可**）で両案を確認し、`openai` / `grok` / `却下` と送る
+3. エージェントが Actions「**林業X承認投稿**」を起動 → Secrets の `X_*` で投稿（PC 操作不要）
 
-GitHub Actions の schedule も **下書き生成のみ**（X Secrets を渡さない）。  
+下書き schedule には **X Secrets を渡さない**。承認 workflow だけが `confirm_live_post=true` 必須で投稿する。  
+代替（上級者）: ローカル `CONFIRM_LIVE_POST=1 python forestry_bot.py approve ...`  
 X Premium 前提の長文可（既定ソフト上限 **8000** 文字、`MAX_POST_CHARS` で変更）。
 
 ## 必要な環境変数

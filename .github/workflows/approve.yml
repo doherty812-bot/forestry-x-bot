@@ -1,0 +1,99 @@
+# 人間承認後の X 投稿（スマホ Cursor → エージェントがこの workflow を起動）
+#
+# 下書き専用の post.yml には X_* を渡さない。
+# この workflow だけが X_* + CONFIRM_LIVE_POST を扱い、confirm_live_post=true 必須。
+#
+# エージェントから本番投稿を勝手に回さないこと。ユーザーが openai|grok を明示したときのみ。
+
+name: 林業X承認投稿
+
+run-name: Approve ${{ inputs.draft_id }} (${{ inputs.provider }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_id:
+        description: '下書き ID（例: 20260924T062759Z-1200）'
+        required: true
+        type: string
+      provider:
+        description: '採用する案'
+        required: true
+        type: choice
+        options:
+          - openai
+          - grok
+      confirm_live_post:
+        description: '本番投稿する（true 必須。false だと失敗）'
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: forestry-approve-${{ inputs.draft_id }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: confirm_live_post ゲート
+        run: |
+          CONF="${{ inputs.confirm_live_post }}"
+          echo "confirm_live_post=$CONF"
+          if [ "$CONF" != "true" ]; then
+            echo "confirm_live_post が true ではないため中止（誤投稿防止）" >&2
+            exit 1
+          fi
+
+      - name: provider を検証
+        run: |
+          P="${{ inputs.provider }}"
+          case "$P" in
+            openai|grok) echo "provider=$P" ;;
+            *) echo "不正な provider: $P" >&2; exit 1 ;;
+          esac
+
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: artifact から下書き JSON を取得
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python scripts/fetch_draft_from_artifacts.py \
+            --draft-id "${{ inputs.draft_id }}" \
+            --out-dir drafts \
+            --workflow post.yml
+
+      - name: 下書き内容をログ（本文は artifact 由来）
+        run: |
+          python forestry_bot.py show-draft "${{ inputs.draft_id }}"
+
+      - name: 承認して X に投稿
+        env:
+          CONFIRM_LIVE_POST: "1"
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+        run: |
+          for v in X_API_KEY X_API_SECRET X_ACCESS_TOKEN X_ACCESS_TOKEN_SECRET; do
+            if [ -z "${!v}" ]; then
+              echo "$v が未設定です（Repo Secrets を確認）" >&2
+              exit 1
+            fi
+          done
+          python forestry_bot.py approve "${{ inputs.draft_id }}" "${{ inputs.provider }}"

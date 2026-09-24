@@ -1319,5 +1319,6 @@ if __name__ == "__main__":
             "  python forestry_bot.py list-drafts\n"
             "  python forestry_bot.py show-draft <id>\n"
             "  CONFIRM_LIVE_POST=1 python forestry_bot.py approve <id> openai|grok\n"
+            "  （主経路は GitHub Actions「林業X承認投稿」。スマホ Cursor で openai|grok を送信）\n"
             "  python forestry_bot.py dry-run-format"
         )

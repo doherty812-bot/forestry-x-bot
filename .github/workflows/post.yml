@@ -1,7 +1,7 @@
 name: 林業X下書き生成
 
 # 人間承認制: schedule / 手動とも「下書き生成のみ」。X には投稿しない。
-# 投稿はローカル/Cursor で CONFIRM_LIVE_POST=1 python forestry_bot.py approve ... のみ。
+# 投稿の主経路は別 workflow「林業X承認投稿」（approve.yml）。
 # Enable 済みでも誤爆しないよう、この workflow に X_* Secrets を渡さない。
 on:
   schedule:
