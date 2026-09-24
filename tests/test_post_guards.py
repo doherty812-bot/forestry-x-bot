@@ -27,6 +27,19 @@ class TestBuildTweetPayload(unittest.TestCase):
         self.assertIn(bot.HASHTAGS, full)
         self.assertIn(url, full)
 
+    def test_multiple_urls(self):
+        body = "複数ソースを踏まえたコメントです。"
+        urls = ["https://ex.com/a", "https://ex.com/b"]
+        full, _ = bot.build_tweet_payload(body, urls)
+        self.assertIn("https://ex.com/a", full)
+        self.assertIn("https://ex.com/b", full)
+
+    def test_long_body_not_cut_at_140(self):
+        body = "あ" * 500
+        full, _ = bot.build_tweet_payload(body, "https://ex.com/x")
+        self.assertGreater(len(full), 140)
+        self.assertIn("あ" * 100, full)
+
     def test_empty_raises(self):
         with self.assertRaises(ValueError):
             bot.build_tweet_payload("", "https://example.com")
@@ -61,23 +74,30 @@ class TestLivePostGuard(unittest.TestCase):
 
 class TestDraftOnlyJobs(unittest.TestCase):
     def test_noon_does_not_post(self):
+        sources = [
+            {"title": "題1", "snippet": "概要1", "url": "https://ex.com/a", "label": "木材新聞"},
+            {"title": "題2", "snippet": "概要2", "url": "https://ex.com/b", "label": "林野庁"},
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.object(bot, "collect_noon_article", return_value=("題", "概要", "https://ex.com/a")), \
-                 patch.object(bot, "generate_buzz_insight_tweet", side_effect=lambda t, s, provider="openai": f"{provider}-本文です。"), \
+                 patch.object(bot, "collect_noon_sources", return_value=sources), \
+                 patch.object(bot, "generate_buzz_insight_tweet", side_effect=lambda src, provider="openai": f"{provider}-本文です。"), \
                  patch.object(bot, "post_to_x") as mock_post:
                 draft = bot.noon_job()
                 mock_post.assert_not_called()
                 self.assertEqual(draft["status"], "pending")
+                self.assertEqual(len(draft["sources"]), 2)
+                self.assertEqual(len(draft["urls"]), 2)
                 self.assertIn("openai", draft["candidates"])
                 self.assertIn("grok", draft["candidates"])
                 self.assertTrue(Path(tmp, f"{draft['id']}.json").exists())
 
     def test_evening_uses_industry_generator(self):
+        sources = [{"title": "DX", "snippet": "生産性", "url": "https://ex.com/b", "label": "経営"}]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.object(bot, "collect_evening_article", return_value=("DX", "生産性", "https://ex.com/b")), \
-                 patch.object(bot, "generate_industry_trend_tweet", side_effect=lambda t, s, provider="openai": f"{provider}-示唆です。") as mock_gen, \
+                 patch.object(bot, "collect_evening_sources", return_value=sources), \
+                 patch.object(bot, "generate_industry_trend_tweet", side_effect=lambda src, provider="openai": f"{provider}-示唆です。") as mock_gen, \
                  patch.object(bot, "generate_buzz_insight_tweet") as mock_domestic, \
                  patch.object(bot, "post_to_x") as mock_post:
                 draft = bot.pre_evening_job()
@@ -111,6 +131,7 @@ class TestApproveFlow(unittest.TestCase):
                     "id": "testdraft2",
                     "status": "pending",
                     "article": {"url": "https://ex.com/n"},
+                    "urls": ["https://ex.com/n", "https://ex.com/m"],
                     "candidates": {
                         "openai": {"text": "OpenAI案です。", "guard_ok": True, "flags": []},
                         "grok": {"text": "Grok案です。", "guard_ok": True, "flags": []},
@@ -118,7 +139,9 @@ class TestApproveFlow(unittest.TestCase):
                 }
                 draft_store.save_draft(draft)
                 bot.approve_and_post("testdraft2", "grok")
-                mock_post.assert_called_once_with("Grok案です。", "https://ex.com/n")
+                mock_post.assert_called_once_with(
+                    "Grok案です。", ["https://ex.com/n", "https://ex.com/m"]
+                )
                 saved = draft_store.load_draft("testdraft2")
                 self.assertEqual(saved["status"], "posted")
                 self.assertEqual(saved["posted_provider"], "grok")
@@ -132,7 +155,8 @@ class TestIndustryTrendPolicy(unittest.TestCase):
                 self.assertNotIn(marker, q)
 
     def test_system_prompt_has_mislead_guard(self):
-        self.assertIn("ミスリード防止", bot.INDUSTRY_TREND_SYSTEM_PROMPT)
+        self.assertIn("ミスリード防止", bot._industry_system_prompt())
+        self.assertIn("Premium", bot._industry_system_prompt())
 
 
 class TestEnvModelDefaults(unittest.TestCase):
@@ -146,13 +170,19 @@ class TestEnvModelDefaults(unittest.TestCase):
         with patch.dict(os.environ, {"GROK_MODEL": "grok-4-fast"}):
             self.assertEqual(bot.get_grok_model(), "grok-4-fast")
 
+    def test_max_post_chars_default_is_relaxed(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAX_POST_CHARS", None)
+            self.assertGreaterEqual(bot.get_max_post_chars(), 2000)
+
 
 class TestDualCandidateErrors(unittest.TestCase):
     def test_errors_are_recorded_not_empty_text_only(self):
-        def boom(title, snippet, provider="openai"):
+        def boom(sources, provider="openai"):
             raise RuntimeError(f"{provider} API呼び出し失敗 (model=): missing")
 
-        cands = bot.build_dual_candidates("t", "s", boom)
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        cands = bot.build_dual_candidates(sources, boom)
         for p in ("openai", "grok"):
             self.assertIsNone(cands[p]["text"])
             self.assertIn("generation_error", cands[p]["flags"])
@@ -162,11 +192,12 @@ class TestDualCandidateErrors(unittest.TestCase):
     def test_both_fail_marks_draft_failed_and_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)):
-                def boom(title, snippet, provider="openai"):
+                def boom(sources, provider="openai"):
                     raise RuntimeError(f"{provider} down")
 
+                sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]
                 with self.assertRaises(RuntimeError) as ctx:
-                    bot.create_dual_draft("12:00", "題", "概要", "https://ex.com", boom)
+                    bot.create_dual_draft("12:00", sources, boom)
                 self.assertIn("両方", str(ctx.exception))
                 drafts = list(Path(tmp).glob("*.json"))
                 self.assertEqual(len(drafts), 1)
@@ -175,6 +206,36 @@ class TestDualCandidateErrors(unittest.TestCase):
                 self.assertEqual(data["status"], "failed")
                 self.assertTrue(data["candidates"]["openai"]["error"])
                 self.assertTrue(data["candidates"]["grok"]["error"])
+
+
+class TestMultiSourceCatalog(unittest.TestCase):
+    def test_noon_catalog_includes_mokuzai_shimbun(self):
+        labels = [x[0] for x in bot.NOON_SOURCE_QUERIES]
+        self.assertIn("木材新聞", labels)
+        self.assertIn("林野庁", labels)
+
+    def test_collect_sources_dedupes_and_caps(self):
+        fake_catalog = [
+            ("A", "query-a"),
+            ("B", "query-b"),
+            ("C", "query-c"),
+        ]
+
+        def fake_parse(query, limit=2):
+            return [{
+                "title": f"t-{query}",
+                "url": f"https://ex.com/{query}",
+                "source": "S",
+                "snippet": "snip",
+                "query": query,
+            }]
+
+        with patch.object(bot, "_parse_rss_items", side_effect=fake_parse), \
+             patch.object(bot, "get_max_sources", return_value=2):
+            sources = bot.collect_sources_from_catalog(fake_catalog, "test")
+            self.assertEqual(len(sources), 2)
+            urls = [s["url"] for s in sources]
+            self.assertEqual(len(urls), len(set(urls)))
 
 
 class TestCredentials(unittest.TestCase):

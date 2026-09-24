@@ -4,11 +4,12 @@
 
 ## 設計（要約）
 
-1. `draft 12:00|20:00` … 記事取得 → ChatGPT（OpenAI）案 + Grok 案を `drafts/` に保存（投稿しない）
+1. `draft 12:00|20:00` … **複数ソース**取得 → ChatGPT + Grok 案を `drafts/` に保存（投稿しない）
 2. Cursor 等で両案を確認（ミスリード警告フラグも表示）
 3. `CONFIRM_LIVE_POST=1 python forestry_bot.py approve <id> openai|grok` … 選択した案のみ投稿
 
-GitHub Actions の schedule も **下書き生成のみ**（X Secrets を渡さない）。
+GitHub Actions の schedule も **下書き生成のみ**（X Secrets を渡さない）。  
+X Premium 前提の長文可（既定ソフト上限 **8000** 文字、`MAX_POST_CHARS` で変更）。
 
 ## 必要な環境変数
 
@@ -19,6 +20,8 @@ GitHub Actions の schedule も **下書き生成のみ**（X Secrets を渡さ�
 | `X_API_KEY` / `X_API_SECRET` / `X_ACCESS_TOKEN` / `X_ACCESS_TOKEN_SECRET` | 投稿時 | X API |
 | `OPENAI_BASE_URL` / `XAI_BASE_URL` | 任意 | 互換エンドポイント |
 | `OPENAI_MODEL` / `GROK_MODEL` | 任意 | モデル上書き |
+| `MAX_POST_CHARS` | 任意 | 投稿ソフト上限（既定 8000） |
+| `MAX_SOURCES` | 任意 | 下書きに付けるソース数 1〜5（既定 3） |
 | `CONFIRM_LIVE_POST` | 投稿時 | `1` のときのみ `approve` 可 |
 
 ## ローカル
@@ -41,7 +44,7 @@ unset CONFIRM_LIVE_POST
 
 ## コンテンツ枠
 
-- **12:00**: 国内農林業ニュース × 現場コメント
-- **20:00**: 産業・経営トレンド × 林業への示唆
+- **12:00**: 国内農林業・木材系の**複数ソース** × 現場コメント
+- **20:00**: 産業・経営トレンドの**複数ソース** × 林業への示唆
 
 固定タグ: `#林業 #forest`
