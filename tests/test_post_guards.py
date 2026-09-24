@@ -233,8 +233,11 @@ class TestObsidianContext(unittest.TestCase):
             self.assertEqual(resolved, vault.resolve())
 
     def test_default_windows_path_constant(self):
-        self.assertIn("OneDrive", bot.DEFAULT_OBSIDIAN_VAULT_PATH)
-        self.assertIn("Obsidian Vault", bot.DEFAULT_OBSIDIAN_VAULT_PATH)
+        self.assertEqual(
+            bot.DEFAULT_OBSIDIAN_VAULT_PATH,
+            r"C:\Users\info\Obsidian Vault",
+        )
+        self.assertNotIn("OneDrive", bot.DEFAULT_OBSIDIAN_VAULT_PATH)
 
     def test_generator_includes_obsidian_in_user_prompt(self):
         sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]

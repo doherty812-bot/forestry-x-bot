@@ -89,7 +89,7 @@ DEFAULT_OBSIDIAN_MISSING_POLICY = "warn"
 DEFAULT_OBSIDIAN_MAX_FILES = 8
 DEFAULT_OBSIDIAN_MAX_CHARS = 6000
 # ローカル Windows 既定（Actions の Linux ランナーでは存在しない → 次候補／警告へ）
-DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\OneDrive\ドキュメント\Obsidian Vault"
+DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\Obsidian Vault"
 # Actions 向け: リポジトリ内の同期先（実ノートは gitignore。中身があれば最優先）
 REPO_OBSIDIAN_DIRS = ("obsidian", "vault-sync")
 
@@ -166,8 +166,8 @@ def resolve_obsidian_vault_path():
 
     優先順（Actions＝Linux / ローカル Windows 両対応）:
       A. リポジトリ内 `obsidian/` または `vault-sync/`（.md が1件以上あるとき）
-      B. OBSIDIAN_VAULT_PATH → OBSIDIAN_SYNC_PATH → コード既定の Windows OneDrive パス
-         （パスが実在するローカル／self-hosted 向け。Actions では通常届かない）
+      B. OBSIDIAN_VAULT_PATH → OBSIDIAN_SYNC_PATH → コード既定の Windows ローカルパス
+         （パスが実在するローカル／self-hosted 向け。Actions hosted では通常届かない）
     いずれも無ければ None（呼び出し側が warn で空コンテキスト続行、または fail）。
     """
     from pathlib import Path
@@ -185,7 +185,7 @@ def resolve_obsidian_vault_path():
         except OSError as e:
             logger.warning(f"Obsidian パス確認失敗: {path}: {e}")
 
-    # B: 環境変数、なければ Windows ローカル既定
+    # B: 環境変数、なければ Windows ローカル既定（C:\Users\info\Obsidian Vault）
     candidates = []
     for name in ("OBSIDIAN_VAULT_PATH", "OBSIDIAN_SYNC_PATH"):
         raw = os.environ.get(name)
