@@ -20,6 +20,7 @@ import os
 import random
 import time
 import logging
+import inspect
 from datetime import datetime, timezone
 import tweepy
 from openai import OpenAI
@@ -83,6 +84,25 @@ DEFAULT_MAX_POST_CHARS = 8000
 DEFAULT_MAX_SOURCES = 3
 DEFAULT_GEN_MAX_TOKENS = 1200
 VALID_PROVIDERS = ("openai", "grok")
+# Obsidian: 無い／読めないときは警告して空コンテキストで続行（fail にすると下書き中止）
+DEFAULT_OBSIDIAN_MISSING_POLICY = "warn"
+DEFAULT_OBSIDIAN_MAX_FILES = 8
+DEFAULT_OBSIDIAN_MAX_CHARS = 6000
+# ローカル Windows 既定（Actions の Linux ランナーでは存在しない → 次候補／警告へ）
+DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\OneDrive\ドキュメント\Obsidian Vault"
+# Actions 向け: リポジトリ内の同期先（実ノートは gitignore。中身があれば最優先）
+REPO_OBSIDIAN_DIRS = ("obsidian", "vault-sync")
+
+# OpenAI / Grok 共通: 読者問いかけをやめ、一人称の意志を出す
+VOICE_FIRST_PERSON_PROMPT = """
+【文体・一人称の意志（最重要・両モデル共通）】
+・読者への問いかけは禁止する（例: 「皆さんは〜？」「どう思いますか」「皆様の現場では」「どのようにお考えですか」）
+・一人称の意志・見解を明示する（例: 「私は〜と考えます」「このように思います」「自分としては〜です」）
+・締めは問いかけではなく、自分の考え・方針・これからやることの一文にする
+・「です」「ます」調。禁止語尾: 「〜だろう」「〜だな」「〜かな」「〜ですな」
+・絵文字なし。硬い「〜が重要です」「〜を推進します」は避ける
+・1文ごとに改行（句点「。」の後は改行）
+"""
 
 
 def env_or_default(name: str, default: str) -> str:
@@ -127,6 +147,207 @@ def get_grok_model() -> str:
 
 def get_xai_base_url() -> str:
     return env_or_default("XAI_BASE_URL", DEFAULT_XAI_BASE_URL)
+
+
+def get_obsidian_missing_policy() -> str:
+    """vault が無い／読めないときの方針: warn（続行）または fail（中止）。"""
+    raw = env_or_default("OBSIDIAN_MISSING_POLICY", DEFAULT_OBSIDIAN_MISSING_POLICY).lower()
+    if raw not in ("warn", "fail"):
+        logger.warning(
+            f"OBSIDIAN_MISSING_POLICY={raw!r} は未対応のため {DEFAULT_OBSIDIAN_MISSING_POLICY} を使います"
+        )
+        return DEFAULT_OBSIDIAN_MISSING_POLICY
+    return raw
+
+
+def resolve_obsidian_vault_path():
+    """
+    Obsidian vault のルートを解決する。
+
+    優先順（Actions＝Linux / ローカル Windows 両対応）:
+      A. リポジトリ内 `obsidian/` または `vault-sync/`（.md が1件以上あるとき）
+      B. OBSIDIAN_VAULT_PATH → OBSIDIAN_SYNC_PATH → コード既定の Windows OneDrive パス
+         （パスが実在するローカル／self-hosted 向け。Actions では通常届かない）
+    いずれも無ければ None（呼び出し側が warn で空コンテキスト続行、または fail）。
+    """
+    from pathlib import Path
+
+    # A: repo 同期フォルダ（中身があるものだけ。空の .gitkeep 置き場はスキップ）
+    for name in REPO_OBSIDIAN_DIRS:
+        path = Path(name)
+        try:
+            if path.is_dir() and _iter_obsidian_markdown(path):
+                resolved = path.resolve()
+                logger.info(f"Obsidian vault: repo 同期を使用 ({name}/) → {resolved}")
+                return resolved
+            if path.is_dir():
+                logger.info(f"Obsidian: {name}/ はあるが .md なし — 次候補へ")
+        except OSError as e:
+            logger.warning(f"Obsidian パス確認失敗: {path}: {e}")
+
+    # B: 環境変数、なければ Windows ローカル既定
+    candidates = []
+    for name in ("OBSIDIAN_VAULT_PATH", "OBSIDIAN_SYNC_PATH"):
+        raw = os.environ.get(name)
+        if raw and str(raw).strip():
+            candidates.append(Path(str(raw).strip()).expanduser())
+    if not candidates:
+        candidates.append(Path(DEFAULT_OBSIDIAN_VAULT_PATH))
+
+    for path in candidates:
+        try:
+            if path.is_dir():
+                resolved = path.resolve()
+                logger.info(f"Obsidian vault: ローカル／指定パスを使用 → {resolved}")
+                return resolved
+        except OSError as e:
+            logger.warning(f"Obsidian パス確認失敗: {path}: {e}")
+
+    return None
+
+
+def _iter_obsidian_markdown(vault_root):
+    """vault 内の .md を新しい順で返す。.obsidian は除外。"""
+    from pathlib import Path
+
+    root = Path(vault_root)
+    files = []
+    for path in root.rglob("*.md"):
+        parts = set(path.parts)
+        if ".obsidian" in parts or ".trash" in parts:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        files.append((mtime, path))
+    files.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in files]
+
+
+def load_obsidian_context(
+    max_files: int | None = None,
+    max_chars: int | None = None,
+) -> dict:
+    """
+    下書き生成前に Obsidian ノートを読み、プロンプト用テキストを返す。
+
+    戻り値 dict:
+      text, status (ok|missing|empty|error), path, files_used, warning
+    vault が無い場合は policy=warn なら空 text で続行、fail なら RuntimeError。
+    """
+    from pathlib import Path
+
+    max_files = max_files if max_files is not None else env_int(
+        "OBSIDIAN_MAX_FILES", DEFAULT_OBSIDIAN_MAX_FILES
+    )
+    max_chars = max_chars if max_chars is not None else env_int(
+        "OBSIDIAN_MAX_CHARS", DEFAULT_OBSIDIAN_MAX_CHARS
+    )
+    max_files = max(1, max_files)
+    max_chars = max(200, max_chars)
+    policy = get_obsidian_missing_policy()
+    vault = resolve_obsidian_vault_path()
+
+    if vault is None:
+        msg = (
+            "Obsidian vault が見つかりません "
+            "(repo obsidian|vault-sync / OBSIDIAN_VAULT_PATH / 既定 Windows パス)。"
+            f" policy={policy}"
+        )
+        if policy == "fail":
+            logger.error(msg)
+            raise RuntimeError(msg)
+        logger.warning(msg + " — 空コンテキストで続行します")
+        return {
+            "text": "",
+            "status": "missing",
+            "path": None,
+            "files_used": [],
+            "warning": msg,
+        }
+
+    try:
+        md_files = _iter_obsidian_markdown(vault)[:max_files]
+    except OSError as e:
+        msg = f"Obsidian vault を読めません: {vault}: {e} (policy={policy})"
+        if policy == "fail":
+            logger.error(msg)
+            raise RuntimeError(msg) from e
+        logger.warning(msg + " — 空コンテキストで続行します")
+        return {
+            "text": "",
+            "status": "error",
+            "path": str(vault),
+            "files_used": [],
+            "warning": msg,
+        }
+
+    if not md_files:
+        msg = f"Obsidian vault に .md がありません: {vault} (policy={policy})"
+        if policy == "fail":
+            logger.error(msg)
+            raise RuntimeError(msg)
+        logger.warning(msg + " — 空コンテキストで続行します")
+        return {
+            "text": "",
+            "status": "empty",
+            "path": str(vault),
+            "files_used": [],
+            "warning": msg,
+        }
+
+    chunks = []
+    used = []
+    total = 0
+    for path in md_files:
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.warning(f"Obsidian ノート読込失敗: {path}: {e}")
+            continue
+        rel = path.relative_to(vault) if path.is_relative_to(vault) else Path(path.name)
+        header = f"### {rel}\n"
+        remain = max_chars - total - len(header)
+        if remain <= 0:
+            break
+        excerpt = body.strip()
+        if len(excerpt) > remain:
+            excerpt = excerpt[: remain - 1] + "…"
+        chunk = header + excerpt
+        chunks.append(chunk)
+        used.append(str(rel))
+        total += len(chunk) + 2
+
+    text = "\n\n".join(chunks).strip()
+    logger.info(
+        f"Obsidian コンテキスト読込: vault={vault} files={len(used)} chars={len(text)}"
+    )
+    return {
+        "text": text,
+        "status": "ok",
+        "path": str(vault),
+        "files_used": used,
+        "warning": None,
+    }
+
+
+def format_obsidian_for_prompt(obsidian: dict | None) -> str:
+    """生成 user プロンプト用の Obsidian ブロック。空なら短い注記のみ。"""
+    if not obsidian or not (obsidian.get("text") or "").strip():
+        status = (obsidian or {}).get("status") or "missing"
+        return (
+            "【Obsidian メモ】\n"
+            f"（参照なし: status={status}。"
+            "ノートが無い場合はソースと人物像だけで書いてください。）"
+        )
+    files = obsidian.get("files_used") or []
+    return (
+        "【Obsidian メモ（下書き前に参照したノート。口調・関心・方針の手がかり）】\n"
+        f"vault={obsidian.get('path')} files={len(files)}\n"
+        f"{obsidian['text']}\n"
+        "上記メモの事実を捏造で広げず、自分の考えを述べるときの背景にしてください。"
+    )
 
 
 # 後方互換: モジュール属性（テストや表示用）。実行時は get_*_model() を使う。
@@ -829,7 +1050,13 @@ def generate_global_buzz_tweet(query, articles):
 # =========================================================
 # ツイート生成（昼12時: 国内農林業ニュース × 実務コメント）
 # =========================================================
-def generate_buzz_insight_tweet(sources, provider="openai", article_title=None, article_snippet=None):
+def generate_buzz_insight_tweet(
+    sources,
+    provider="openai",
+    article_title=None,
+    article_snippet=None,
+    obsidian_context=None,
+):
     """
     昼12時枠: 複数の国内農林業ソースを踏まえ、現場実務コメント付き投稿を生成する。
     sources: list[dict]（推奨）。旧引数 title/snippet のみの呼び出しも互換。
@@ -851,20 +1078,17 @@ def generate_buzz_insight_tweet(sources, provider="openai", article_title=None, 
 ・地方の人口減少・人手不足を冷静に見据え、AI・ロボット活用を必然的手段として捉える
 
 【投稿の目的】
-複数ソース（最大{n}件）に触れつつ、第一人称の現場感覚を語る。
+複数ソース（最大{n}件）に触れつつ、第一人称の現場感覚と自分の意志を語る。
 1記事の要約だけで終わらない。出典の違いや共通点にも軽く触れてよい。
 
-【文体】
-・1文ごとに改行（句点「。」の後は改行）
-・「です」「ます」調。禁止語尾: 「〜だろう」「〜だな」「〜かな」「〜ですな」
-・絵文字なし。硬い「〜が重要です」「〜を推進します」は避ける
+{VOICE_FIRST_PERSON_PROMPT}
 
 {MISLEAD_GUARD_PROMPT}
 
 【構成】
 1. 複数ソースのテーマを自分の言葉で（短く）
 2. 現場目線のコメント（2〜4文程度でも可）
-3. 考え・問いかけ
+3. 「私は〜と考えます」など一人称の意志・方針（問いかけで締めない）
 4. 末尾に #林業 #森林 #forest（URLは付けない。システムが後付けする）
 
 【文字数】
@@ -872,11 +1096,17 @@ def generate_buzz_insight_tweet(sources, provider="openai", article_title=None, 
 ・URLは含めない。
 """
 
+    if obsidian_context is None:
+        obsidian_context = load_obsidian_context()
+
     user_content = f"""
 以下の国内農林業・木材関連ソース（{n}件）を踏まえて投稿を作成してください。
 価格・相場は根拠が無い限り断定しないでください。
+読者への問いかけはせず、一人称の意志で締めてください。
 
 {format_sources_for_prompt(sources)}
+
+{format_obsidian_for_prompt(obsidian_context)}
 """
 
     try:
@@ -907,17 +1137,16 @@ def _industry_system_prompt():
 【投稿の目的】
 複数の産業・経営トレンドを引用し、「林業経営ではこう読み替える」示唆を必ず入れる。
 国内農林業ニュースの単なる紹介に終始しない。
+締めは読者への問いかけではなく、一人称の意志・方針にする。
 
-【文体】
-・1文ごとに改行。「です」「ます」調。
-・禁止: 「〜だろう」「〜だな」「〜かな」「〜ですな」、絵文字、硬い定型句
+{VOICE_FIRST_PERSON_PROMPT}
 
 {MISLEAD_GUARD_PROMPT}
 
 【構成】
 1. 複数トレンドの要点
 2. 林業・森林経営への示唆（必須）
-3. 短い問いかけ
+3. 「私は〜と考えます」「このように思います」など一人称の意志（問いかけ禁止）
 4. 末尾ハッシュタグ #林業 #森林 #forest（URLは付けない）
 
 【文字数】
@@ -929,7 +1158,13 @@ def _industry_system_prompt():
 INDUSTRY_TREND_SYSTEM_PROMPT = None  # 実行時に _industry_system_prompt() を使う
 
 
-def generate_industry_trend_tweet(sources, provider="openai", article_title=None, article_snippet=None):
+def generate_industry_trend_tweet(
+    sources,
+    provider="openai",
+    article_title=None,
+    article_snippet=None,
+    obsidian_context=None,
+):
     """
     夜20時枠: 複数の産業・経営トレンドを踏まえ、林業への示唆付き投稿を生成する。
     """
@@ -939,12 +1174,17 @@ def generate_industry_trend_tweet(sources, provider="openai", article_title=None
         raise ValueError("sources が空です")
 
     system_prompt = _industry_system_prompt()
+    if obsidian_context is None:
+        obsidian_context = load_obsidian_context()
     user_content = f"""
 以下は産業・経営・経済・テクノロジー分野のソース（{len(sources)}件）です。
 国内農林業ニュースの要約だけにしないでください。
 林業経営への読み替えを必ず含め、複数ソースに触れてください。
+読者への問いかけはせず、一人称の意志で締めてください。
 
 {format_sources_for_prompt(sources)}
+
+{format_obsidian_for_prompt(obsidian_context)}
 """
 
     try:
@@ -1116,7 +1356,26 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
     urls = sources_as_urls(sources)
     if not urls:
         raise RuntimeError("記事URLが取得できないため下書きを中止しました")
-    candidates = build_dual_candidates(sources, generator)
+
+    # 両モデル生成前に Obsidian を一度だけ読む（無い場合は warn で空コンテキスト）
+    obsidian = load_obsidian_context()
+    logger.info(
+        f"Obsidian 参照: status={obsidian.get('status')} "
+        f"path={obsidian.get('path')} files={len(obsidian.get('files_used') or [])}"
+    )
+
+    def _accepts_obsidian(fn) -> bool:
+        try:
+            return "obsidian_context" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def generator_with_obsidian(src, provider="openai"):
+        if _accepts_obsidian(generator):
+            return generator(src, provider=provider, obsidian_context=obsidian)
+        return generator(src, provider=provider)
+
+    candidates = build_dual_candidates(sources, generator_with_obsidian)
     any_ok = any(
         (c.get("text") and not c.get("error")) for c in candidates.values()
     )
@@ -1139,6 +1398,13 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
         "limits": {
             "max_post_chars": get_max_post_chars(),
             "max_sources": get_max_sources(),
+        },
+        "obsidian": {
+            "status": obsidian.get("status"),
+            "path": obsidian.get("path"),
+            "files_used": obsidian.get("files_used") or [],
+            "warning": obsidian.get("warning"),
+            "char_count": len(obsidian.get("text") or ""),
         },
     }
     path = save_draft(draft)

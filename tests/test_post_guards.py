@@ -155,8 +155,152 @@ class TestIndustryTrendPolicy(unittest.TestCase):
                 self.assertNotIn(marker, q)
 
     def test_system_prompt_has_mislead_guard(self):
-        self.assertIn("ミスリード防止", bot._industry_system_prompt())
-        self.assertIn("Premium", bot._industry_system_prompt())
+        prompt = bot._industry_system_prompt()
+        self.assertIn("ミスリード防止", prompt)
+        self.assertIn("Premium", prompt)
+
+    def test_system_prompt_first_person_not_reader_questions(self):
+        prompt = bot._industry_system_prompt()
+        self.assertIn("一人称", prompt)
+        self.assertIn("問いかけは禁止", prompt)
+        self.assertIn("私は〜と考えます", prompt)
+        self.assertIn(bot.VOICE_FIRST_PERSON_PROMPT.strip().splitlines()[0], prompt)
+
+
+class TestObsidianContext(unittest.TestCase):
+    def test_missing_vault_warns_and_continues(self):
+        with patch.dict(
+            os.environ,
+            {"OBSIDIAN_MISSING_POLICY": "warn"},
+            clear=False,
+        ), patch.object(bot, "resolve_obsidian_vault_path", return_value=None):
+            ctx = bot.load_obsidian_context()
+            self.assertEqual(ctx["status"], "missing")
+            self.assertEqual(ctx["text"], "")
+            self.assertTrue(ctx["warning"])
+
+    def test_missing_vault_fail_raises(self):
+        with patch.dict(os.environ, {"OBSIDIAN_MISSING_POLICY": "fail"}, clear=False), \
+             patch.object(bot, "resolve_obsidian_vault_path", return_value=None):
+            with self.assertRaises(RuntimeError):
+                bot.load_obsidian_context()
+
+    def test_loads_recent_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            (vault / ".obsidian").mkdir()
+            (vault / ".obsidian" / "app.md").write_text("secret-config", encoding="utf-8")
+            note = vault / "経営メモ.md"
+            note.write_text("私は3,000ha拡大を見据えています。\n", encoding="utf-8")
+            with patch.object(bot, "REPO_OBSIDIAN_DIRS", ()), patch.dict(
+                os.environ,
+                {"OBSIDIAN_VAULT_PATH": str(vault), "OBSIDIAN_MISSING_POLICY": "warn"},
+                clear=False,
+            ):
+                ctx = bot.load_obsidian_context()
+            self.assertEqual(ctx["status"], "ok")
+            self.assertIn("3,000ha", ctx["text"])
+            self.assertIn("経営メモ.md", ctx["files_used"])
+            self.assertNotIn("secret-config", ctx["text"])
+
+    def test_resolve_prefers_repo_sync_with_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sync = root / "obsidian"
+            sync.mkdir()
+            (sync / "note.md").write_text("repo sync note\n", encoding="utf-8")
+            local = root / "local-vault"
+            local.mkdir()
+            (local / "other.md").write_text("local only\n", encoding="utf-8")
+            old = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch.object(bot, "REPO_OBSIDIAN_DIRS", ("obsidian", "vault-sync")), \
+                     patch.dict(os.environ, {"OBSIDIAN_VAULT_PATH": str(local)}, clear=False):
+                    resolved = bot.resolve_obsidian_vault_path()
+                self.assertEqual(resolved, sync.resolve())
+            finally:
+                os.chdir(old)
+
+    def test_resolve_uses_env_when_repo_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "vault"
+            vault.mkdir()
+            with patch.object(bot, "REPO_OBSIDIAN_DIRS", ()), patch.dict(
+                os.environ, {"OBSIDIAN_VAULT_PATH": str(vault)}, clear=False
+            ):
+                resolved = bot.resolve_obsidian_vault_path()
+            self.assertEqual(resolved, vault.resolve())
+
+    def test_default_windows_path_constant(self):
+        self.assertIn("OneDrive", bot.DEFAULT_OBSIDIAN_VAULT_PATH)
+        self.assertIn("Obsidian Vault", bot.DEFAULT_OBSIDIAN_VAULT_PATH)
+
+    def test_generator_includes_obsidian_in_user_prompt(self):
+        sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]
+        captured = {}
+
+        def fake_chat(provider, system_prompt, user_content, temperature=0.75):
+            captured["system"] = system_prompt
+            captured["user"] = user_content
+            return "私は現場でこのように考えます。\n#林業 #森林 #forest"
+
+        obsidian = {
+            "text": "### memo.md\n拡大計画のメモ",
+            "status": "ok",
+            "path": "/tmp/vault",
+            "files_used": ["memo.md"],
+            "warning": None,
+        }
+        with patch.object(bot, "chat_complete", side_effect=fake_chat):
+            text = bot.generate_industry_trend_tweet(
+                sources, provider="openai", obsidian_context=obsidian
+            )
+        self.assertIn("私は現場で", text)
+        self.assertIn("一人称", captured["system"])
+        self.assertIn("問いかけは禁止", captured["system"])
+        self.assertIn("拡大計画のメモ", captured["user"])
+        self.assertIn("Obsidian", captured["user"])
+
+    def test_noon_generator_also_first_person(self):
+        sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]
+        captured = {}
+
+        def fake_chat(provider, system_prompt, user_content, temperature=0.75):
+            captured["system"] = system_prompt
+            return "私は工場向け販売を軸に考えます。\n#林業 #森林 #forest"
+
+        with patch.object(bot, "chat_complete", side_effect=fake_chat):
+            bot.generate_buzz_insight_tweet(
+                sources,
+                provider="grok",
+                obsidian_context={"text": "", "status": "missing", "path": None, "files_used": [], "warning": "x"},
+            )
+        self.assertIn("問いかけは禁止", captured["system"])
+        self.assertIn("私は〜と考えます", captured["system"])
+
+    def test_create_dual_draft_records_obsidian_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.object(
+                     bot,
+                     "load_obsidian_context",
+                     return_value={
+                         "text": "",
+                         "status": "missing",
+                         "path": None,
+                         "files_used": [],
+                         "warning": "no vault",
+                     },
+                 ):
+                sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]
+                draft = bot.create_dual_draft(
+                    "20:00",
+                    sources,
+                    lambda src, provider="openai": f"{provider} 私はこう考えます。",
+                )
+                self.assertEqual(draft["obsidian"]["status"], "missing")
+                self.assertEqual(draft["status"], "pending")
 
 
 class TestEnvModelDefaults(unittest.TestCase):

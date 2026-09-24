@@ -23,6 +23,8 @@ X Premium 前提の長文可（既定ソフト上限 **8000** 文字、`MAX_POST
 | `OPENAI_MODEL` / `GROK_MODEL` | 任意 | モデル上書き |
 | `MAX_POST_CHARS` | 任意 | 投稿ソフト上限（既定 8000） |
 | `MAX_SOURCES` | 任意 | 下書きに付けるソース数 1〜5（既定 3） |
+| `OBSIDIAN_VAULT_PATH` | 任意 | ローカル Obsidian vault（Windows 既定あり）。Actions は repo `obsidian/` 同期を優先 |
+| `OBSIDIAN_MISSING_POLICY` | 任意 | `warn`（既定・空で続行）または `fail` |
 | `CONFIRM_LIVE_POST` | 投稿時 | `1` のときのみ `approve` 可 |
 
 ## ローカル
@@ -44,6 +46,7 @@ unset CONFIRM_LIVE_POST
 詳細:
 - スマホ承認: Project の `docs/mobile-cursor-approve.md`
 - 二系統運用: Project の `docs/dual-ai-approval-flow.md`
+- 文体・Obsidian: Project の `docs/voice-and-obsidian.md`
 
 エージェントからの承認起動（PAT 必須・値は Secrets）:
 
