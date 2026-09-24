@@ -41,7 +41,18 @@ python forestry_bot.py approve <draft_id> openai   # または grok
 unset CONFIRM_LIVE_POST
 ```
 
-詳細: Project の `docs/dual-ai-approval-flow.md`
+詳細:
+- スマホ承認: Project の `docs/mobile-cursor-approve.md`
+- 二系統運用: Project の `docs/dual-ai-approval-flow.md`
+
+エージェントからの承認起動（PAT 必須・値は Secrets）:
+
+```bash
+# 権限確認のみ（投稿しない）
+scripts/dispatch_approve.sh --check-auth
+# ユーザーが openai|grok を選んだあと（本番）
+scripts/dispatch_approve.sh --draft-id <ID> --provider grok --confirm
+```
 
 ## コンテンツ枠
 
