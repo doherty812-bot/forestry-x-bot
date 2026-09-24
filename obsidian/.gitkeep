@@ -1,0 +1,3 @@
+# Optional checkout / artifact mount point for Obsidian notes.
+# Set OBSIDIAN_VAULT_PATH to this directory or your real vault path.
+# Do not commit private notes here.

@@ -40,6 +40,10 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          # Obsidian: パスは Variables / Secrets で後から設定。未設定なら ./obsidian を探し、無ければ警告して続行
+          OBSIDIAN_VAULT_PATH: ${{ vars.OBSIDIAN_VAULT_PATH }}
+          OBSIDIAN_SYNC_PATH: ${{ vars.OBSIDIAN_SYNC_PATH }}
+          OBSIDIAN_MISSING_POLICY: ${{ vars.OBSIDIAN_MISSING_POLICY }}
         run: |
           # モデル名: Secret が空文字のときはコード側既定値を使うため、空なら unset
           if [ -n "${{ secrets.OPENAI_MODEL }}" ]; then
@@ -54,6 +58,15 @@ jobs:
           # 空の OPENAI_BASE_URL は unset（公式エンドポイントへ）
           if [ -z "${OPENAI_BASE_URL}" ]; then
             unset OPENAI_BASE_URL
+          fi
+          if [ -z "${OBSIDIAN_VAULT_PATH}" ]; then
+            unset OBSIDIAN_VAULT_PATH
+          fi
+          if [ -z "${OBSIDIAN_SYNC_PATH}" ]; then
+            unset OBSIDIAN_SYNC_PATH
+          fi
+          if [ -z "${OBSIDIAN_MISSING_POLICY}" ]; then
+            export OBSIDIAN_MISSING_POLICY=warn
           fi
           if [ -z "${XAI_API_KEY}" ] && [ -z "${GROK_API_KEY}" ]; then
             echo "XAI_API_KEY または GROK_API_KEY が未設定です" >&2
@@ -76,6 +89,8 @@ jobs:
           echo "下書きスロット: $SLOT（X投稿は行いません）"
           echo "OPENAI_MODEL=${OPENAI_MODEL:-<code-default>}"
           echo "GROK_MODEL=${GROK_MODEL:-<code-default>}"
+          echo "OBSIDIAN_VAULT_PATH=${OBSIDIAN_VAULT_PATH:-<unset>}"
+          echo "OBSIDIAN_MISSING_POLICY=${OBSIDIAN_MISSING_POLICY}"
           python forestry_bot.py draft "$SLOT"
 
       - name: 下書きアーティファクトを保存
