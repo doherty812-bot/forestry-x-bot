@@ -9,9 +9,10 @@
   3) CONFIRM_LIVE_POST=1 付きで approve <draft_id> <openai|grok> のみ投稿
 
 時間帯別コンテンツ:
-  昼12時 : 国内農林業ニュース × 実務コメント
-  夜20時 : 産業・経営トレンド × 林業経営への示唆
+  昼12時 : 国内農林業ニュース（複数ソース）× 実務コメント
+  夜20時 : 産業・経営トレンド（複数ソース）× 林業経営への示唆
 
+X Premium 前提で長文可（既定ソフト上限 8000 文字、MAX_POST_CHARS で変更）。
 schedule は下書き生成のみ。即時ライブ投稿は行わない。
 """
 
@@ -77,6 +78,10 @@ _grok_client = None
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_GROK_MODEL = "grok-3-mini"
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
+# X Premium 前提。公式上限は大きいが、運用上のソフト上限（env で変更可）
+DEFAULT_MAX_POST_CHARS = 8000
+DEFAULT_MAX_SOURCES = 3
+DEFAULT_GEN_MAX_TOKENS = 1200
 VALID_PROVIDERS = ("openai", "grok")
 
 
@@ -87,6 +92,29 @@ def env_or_default(name: str, default: str) -> str:
         return default
     stripped = str(raw).strip()
     return stripped if stripped else default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def get_max_post_chars() -> int:
+    """投稿本文のソフト上限（ハッシュタグ・URL含む最終ペイロード）。"""
+    return max(280, env_int("MAX_POST_CHARS", DEFAULT_MAX_POST_CHARS))
+
+
+def get_max_sources() -> int:
+    return max(1, min(5, env_int("MAX_SOURCES", DEFAULT_MAX_SOURCES)))
+
+
+def get_gen_max_tokens() -> int:
+    return max(200, env_int("GEN_MAX_TOKENS", DEFAULT_GEN_MAX_TOKENS))
 
 
 def get_openai_model() -> str:
@@ -167,7 +195,7 @@ def chat_complete(provider: str, system_prompt: str, user_content: str, temperat
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=200,
+            max_tokens=get_gen_max_tokens(),
             temperature=temperature,
         )
     except Exception as e:
@@ -341,60 +369,154 @@ QUOTES = [
 ]
 
 # =========================================================
-# ニュース収集（Web検索）
+# ニュース収集（Web検索）／複数ソース
 # =========================================================
+
+# 昼12時: 国内農林業・木材系メディア寄り（Google News クエリ）
+NOON_SOURCE_QUERIES = [
+    ("木材新聞", "木材新聞"),
+    ("日本農業新聞", "日本農業新聞 林業 OR 木材"),
+    ("林野庁", "林野庁"),
+    ("農林水産", "農林水産省 林業"),
+    ("国産材市場", "国産材 市場 OR 市況"),
+    ("森林整備", "森林 整備 政策"),
+    ("スマート林業", "スマート林業 OR 林業 DX"),
+    ("木材建築", "木材利用 建築 国産材"),
+]
+
+# 夜20時: 産業・経営（農林業固定にしない）
+EVENING_SOURCE_QUERIES = [
+    ("日経・経営", "経営 戦略 デジタル化"),
+    ("人手不足", "人手不足 自動化 産業"),
+    ("地方経済", "地方経済 産業再生"),
+    ("サプライチェーン", "サプライチェーン リスク管理"),
+    ("カーボン経営", "カーボンニュートラル 企業経営"),
+    ("中小DX", "中小企業 DX 生産性"),
+    ("事業承継", "中小企業 事業承継"),
+    ("ESG", "ESG 投資 経営"),
+]
+
+
+def _parse_rss_items(query: str, limit: int = 3):
+    """Google News RSS から複数 item を返す。各要素: title, url, source, snippet, query。"""
+    import xml.etree.ElementTree as ET
+    import urllib.parse
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
+    response = requests.get(rss_url, headers=headers, timeout=15)
+    if response.status_code != 200:
+        return []
+    root = ET.fromstring(response.content)
+    items = root.findall(".//item")
+    out = []
+    for item in items[: max(limit, 1)]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+        raw_title = (title_el.text or "").strip() if title_el is not None else ""
+        source = ""
+        title = raw_title
+        if " - " in raw_title:
+            title, source = raw_title.rsplit(" - ", 1)
+            title, source = title.strip(), source.strip()
+        url = link_el.text.strip() if link_el is not None and link_el.text else None
+        if not url:
+            continue
+        snippet = ""
+        if desc_el is not None and desc_el.text:
+            snippet = desc_el.text.strip()[:300]
+        out.append(
+            {
+                "title": title or raw_title,
+                "url": url,
+                "source": source or "Google News",
+                "snippet": snippet,
+                "query": query,
+            }
+        )
+    return out
+
+
 def fetch_forestry_news(query, retry=True):
     """
     Google News RSSで林業関連ニュースを検索して取得する。
-    (snippet_text, article_url) のタプルを返す。
-    URLが必ず取得できるようリトライあり。
+    (snippet_text, article_url) のタプルを返す（後方互換）。
     """
-    import xml.etree.ElementTree as ET
-    import urllib.parse
-    
-    def _fetch(q):
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=ja&gl=JP&ceid=JP:ja"
-        response = requests.get(rss_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            return "", None
-        root = ET.fromstring(response.content)
-        items = root.findall('.//item')
-        snippets = []
-        first_url = None
-        for item in items[:5]:  # 最大5件まで確認
-            title = item.find('title')
-            link = item.find('link')
-            description = item.find('description')
-            # タイトルをスニペットに追加
-            if title is not None and title.text:
-                t = title.text.strip()
-                # 「 - ソース名」の形式を除去しタイトル本文のみ取得
-                if ' - ' in t:
-                    t = t.rsplit(' - ', 1)[0].strip()
-                if t:
-                    snippets.append(t)
-            # URL取得（最初の有効URL）
-            if first_url is None and link is not None and link.text:
-                first_url = link.text.strip()
-        snippet_text = " / ".join(snippets[:3]) if snippets else ""
-        return snippet_text, first_url
-    
     try:
-        snippet, url = _fetch(query)
-        # URLが取得できなかった場合、別クエリでリトライ
-        if url is None and retry:
-            fallback_query = "林業 国内 最新"
-            logger.warning(f"ニュースURL取得失敗。リトライ: {fallback_query}")
-            snippet2, url2 = _fetch(fallback_query)
-            if url2:
-                return snippet2, url2
-        return snippet, url
+        items = _parse_rss_items(query, limit=3)
+        if not items and retry:
+            items = _parse_rss_items("林業 国内 最新", limit=3)
+        if not items:
+            return "", None
+        snippet = " / ".join(i["title"] for i in items[:3])
+        return snippet, items[0]["url"]
     except Exception as e:
         logger.warning(f"ニュース取得エラー: {e}")
         return "", None
+
+
+def collect_sources_from_catalog(catalog, label: str):
+    """
+    カタログから複数クエリを選び、重複URLを除いて最大 get_max_sources() 件集める。
+    戻り値: sources (list[dict]) — 1件以上必須、なければ RuntimeError。
+    """
+    need = get_max_sources()
+    shuffled = list(catalog)
+    random.shuffle(shuffled)
+    collected = []
+    seen_urls = set()
+    for source_label, query in shuffled:
+        if len(collected) >= need:
+            break
+        logger.info(f"{label} ソース取得: [{source_label}] q={query}")
+        try:
+            items = _parse_rss_items(query, limit=2)
+        except Exception as e:
+            logger.warning(f"RSS失敗 [{source_label}]: {e}")
+            continue
+        for item in items:
+            url = item.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            # ラベルを優先表示用に付与
+            item = dict(item)
+            item["label"] = source_label
+            if not item.get("source"):
+                item["source"] = source_label
+            collected.append(item)
+            break  # 1クエリあたり原則1件
+    if len(collected) < 1:
+        raise RuntimeError(f"{label}: 記事URLを1件も取得できませんでした")
+    logger.info(f"{label}: {len(collected)} 件のソースを取得")
+    return collected[:need]
+
+
+def format_sources_for_prompt(sources) -> str:
+    lines = []
+    for i, s in enumerate(sources, 1):
+        lines.append(
+            f"{i}. [{s.get('label') or s.get('source')}] {s.get('title')}\n"
+            f"   概要: {(s.get('snippet') or '（なし）')[:180]}\n"
+            f"   URL: {s.get('url')}"
+        )
+    return "\n".join(lines)
+
+
+def sources_as_urls(sources) -> list:
+    return [s["url"] for s in sources if s.get("url")]
+
+
+def normalize_article_urls(article_url_or_urls):
+    """単一URLまたはURLリストを list[str] に正規化する。"""
+    if not article_url_or_urls:
+        return []
+    if isinstance(article_url_or_urls, str):
+        return [article_url_or_urls] if article_url_or_urls.strip() else []
+    return [u for u in article_url_or_urls if u and str(u).strip()]
 
 
 def fetch_global_forest_buzz():
@@ -707,64 +829,64 @@ def generate_global_buzz_tweet(query, articles):
 # =========================================================
 # ツイート生成（昼12時: 国内農林業ニュース × 実務コメント）
 # =========================================================
-def generate_buzz_insight_tweet(article_title, article_snippet, provider="openai"):
+def generate_buzz_insight_tweet(sources, provider="openai", article_title=None, article_snippet=None):
     """
-    昼12時枠: 国内農林業ニュースを引用し、現場実務コメント付き投稿を生成する。
-    provider: openai | grok
+    昼12時枠: 複数の国内農林業ソースを踏まえ、現場実務コメント付き投稿を生成する。
+    sources: list[dict]（推奨）。旧引数 title/snippet のみの呼び出しも互換。
     """
+    if not sources and (article_title or article_snippet):
+        sources = [{"title": article_title or "", "snippet": article_snippet or "", "url": "", "source": ""}]
+    if not sources:
+        raise ValueError("sources が空です")
+
+    max_chars = get_max_post_chars()
+    n = len(sources)
     system_prompt = f"""
 あなたは新潟で1,500ha規模の森林経営計画を管理し、将来的に3,000haへの拡大を見据える林業経営者「岸本一夫」として、
-国内の農林業系ニュースを読んで、現場目線の実務的コメントを含むX投稿を作成します。
+国内の農林業・木材関連の複数ニュースを読んで、現場目線の実務的コメントを含むX投稿を作成します。
 
 【人物像】
 ・山を「所有」ではなく「経営資源」として捉える実務家
 ・針葉樹・広葉樹の販売先を工場中心に置く現実的な判断力
 ・地方の人口減少・人手不足を冷静に見据え、AI・ロボット活用を必然的手段として捉える
-・現場の泥臭さを知りつつ、森林総合研究所などのエビデンスに基づいた判断を重視
 
 【投稿の目的】
-国内の農林業系ニュースを読んで、自分の現場感覚・経営判断・問題意識を含んだ実務的なコメントを語る。
-単なるニュースの要約や紹介ではなく、「自分はこう見る」という第一人称の視点を必ず加える。
+複数ソース（最大{n}件）に触れつつ、第一人称の現場感覚を語る。
+1記事の要約だけで終わらない。出典の違いや共通点にも軽く触れてよい。
 
-【文体の特徴（最重要）】
-・1文ごとに必ず改行する。句点「。」の後は必ず改行すること
-・短文・中文中心（1文あたり20〜40文字程度）
-・「です」「ます」調を基本とする
-・「〜だろう」「〜だな」「〜かな」「〜ですな」などの語尾は使わない
-・スマートで知性的な口調を保ちつつ、押しつけがましくない
-・絵文字は使わない
-・AIが書いたような「〜が重要です」「〜を推進します」などの硬い表現は避ける
+【文体】
+・1文ごとに改行（句点「。」の後は改行）
+・「です」「ます」調。禁止語尾: 「〜だろう」「〜だな」「〜かな」「〜ですな」
+・絵文字なし。硬い「〜が重要です」「〜を推進します」は避ける
 
 {MISLEAD_GUARD_PROMPT}
 
-【投稿の構成】
-1. 記事のテーマを自分の言葉で簡潔に言及（1文）
-2. 現場目線の実務的コメントまたは問題意識（1〜2文）
-3. 自分の考えや問いかけ（1文）
-4. ハッシュタグ
+【構成】
+1. 複数ソースのテーマを自分の言葉で（短く）
+2. 現場目線のコメント（2〜4文程度でも可）
+3. 考え・問いかけ
+4. 末尾に #林業 #森林 #forest（URLは付けない。システムが後付けする）
 
-【厳守事項】
-・文字数は全体で140文字以内（ハッシュタグ・改行含む）
-・必ず最後に「#林業 #森林 #forest」を付ける
-・URLは含めない
-・140文字を超えた場合は必ず短縮すること
+【文字数】
+・X Premium 前提。本文は目安 {max_chars} 文字以内（ハッシュタグ含む）。無理に短くしない。
+・URLは含めない。
 """
 
     user_content = f"""
-記事タイトル: {article_title}
-記事の概要: {article_snippet[:200] if article_snippet else '（概要なし）'}
+以下の国内農林業・木材関連ソース（{n}件）を踏まえて投稿を作成してください。
+価格・相場は根拠が無い限り断定しないでください。
 
-上記の国内農林業系ニュースを読んで、現場目線の実務的コメントを含む投稿を作成してください。
-価格・相場は記事に根拠が無い限り断定しないでください。
+{format_sources_for_prompt(sources)}
 """
 
     try:
         tweet_text = chat_complete(provider, system_prompt, user_content, temperature=0.75)
-        if len(tweet_text) > 140:
+        soft = get_max_post_chars()
+        if len(tweet_text) > soft:
             tweet_text = chat_complete(
                 provider,
                 system_prompt,
-                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。140文字以内に収めてください。",
+                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
                 temperature=0.5,
             )
         return enforce_linebreaks(tweet_text)
@@ -776,67 +898,63 @@ def generate_buzz_insight_tweet(article_title, article_snippet, provider="openai
 # =========================================================
 # ツイート生成（夜20時: 産業・経営トレンド × 林業への示唆）
 # =========================================================
-INDUSTRY_TREND_SYSTEM_PROMPT = f"""
+def _industry_system_prompt():
+    max_chars = get_max_post_chars()
+    return f"""
 あなたは新潟で1,500ha規模の森林経営計画を管理し、将来的に3,000haへの拡大を見据える林業経営者「岸本一夫」として、
-産業・経営・経済・テクノロジー分野のトレンド記事を読み、林業経営への示唆を含むX投稿を作成します。
-
-【人物像】
-・山を「所有」ではなく「経営資源」として捉える実務家
-・他産業の経営トレンドから学び、自社の森林経営に応用する視点を持つ
-・地方の人口減少・人手不足を冷静に見据え、AI・ロボット活用を必然的手段として捉える
-・押しつけがましくなく、知性的に語る
+産業・経営・経済・テクノロジー分野の複数トレンド記事を読み、林業経営への示唆を含むX投稿を作成します。
 
 【投稿の目的】
-幅広い産業・経営トレンドを引用し、「林業経営ではこう読み替える」という示唆を必ず添える。
-国内農林業ニュースの単なる紹介や現場報告だけに終始しない。
-記事は林業以外の分野でもよい。必ず林業・森林経営への接続を1文以上入れる。
+複数の産業・経営トレンドを引用し、「林業経営ではこう読み替える」示唆を必ず入れる。
+国内農林業ニュースの単なる紹介に終始しない。
 
-【文体の特徴（最重要）】
-・1文ごとに必ず改行する。句点「。」の後は必ず改行すること
-・短文・中文中心（1文あたり20〜40文字程度）
-・「です」「ます」調を基本とする
-・「〜だろう」「〜だな」「〜かな」「〜ですな」などの語尾は使わない
-・絵文字は使わない
-・AIが書いたような「〜が重要です」「〜を推進します」などの硬い表現は避ける
+【文体】
+・1文ごとに改行。「です」「ます」調。
+・禁止: 「〜だろう」「〜だな」「〜かな」「〜ですな」、絵文字、硬い定型句
 
 {MISLEAD_GUARD_PROMPT}
 
-【投稿の構成】
-1. 産業・経営トレンドの要点を自分の言葉で（1文）
-2. 林業経営・森林経営への示唆または読み替え（1〜2文）
-3. 短い問いかけまたは一言（1文）
-4. ハッシュタグ
+【構成】
+1. 複数トレンドの要点
+2. 林業・森林経営への示唆（必須）
+3. 短い問いかけ
+4. 末尾ハッシュタグ #林業 #森林 #forest（URLは付けない）
 
-【厳守事項】
-・文字数は全体で140文字以内（ハッシュタグ・改行含む）
-・必ず最後に「#林業 #森林 #forest」を付ける
-・URLは含めない
-・140文字を超えた場合は必ず短縮すること
+【文字数】
+・X Premium 前提。目安 {max_chars} 文字以内。無理に短縮しない。
+・URLは含めない。
 """
 
 
-def generate_industry_trend_tweet(article_title, article_snippet, provider="openai"):
-    """
-    夜20時枠: 産業・経営トレンド記事を引用し、林業経営への示唆付き投稿を生成する。
-    provider: openai | grok
-    """
-    user_content = f"""
-記事タイトル: {article_title}
-記事の概要: {article_snippet[:200] if article_snippet else '（概要なし）'}
+INDUSTRY_TREND_SYSTEM_PROMPT = None  # 実行時に _industry_system_prompt() を使う
 
-上記は産業・経営・経済・テクノロジー分野のトレンド記事です。
+
+def generate_industry_trend_tweet(sources, provider="openai", article_title=None, article_snippet=None):
+    """
+    夜20時枠: 複数の産業・経営トレンドを踏まえ、林業への示唆付き投稿を生成する。
+    """
+    if not sources and (article_title or article_snippet):
+        sources = [{"title": article_title or "", "snippet": article_snippet or "", "url": "", "source": ""}]
+    if not sources:
+        raise ValueError("sources が空です")
+
+    system_prompt = _industry_system_prompt()
+    user_content = f"""
+以下は産業・経営・経済・テクノロジー分野のソース（{len(sources)}件）です。
 国内農林業ニュースの要約だけにしないでください。
-このトレンドを林業経営にどう読み替えるかを必ず含めて投稿を作成してください。
-価格・相場は記事に根拠が無い限り断定しないでください。
+林業経営への読み替えを必ず含め、複数ソースに触れてください。
+
+{format_sources_for_prompt(sources)}
 """
 
     try:
-        tweet_text = chat_complete(provider, INDUSTRY_TREND_SYSTEM_PROMPT, user_content, temperature=0.75)
-        if len(tweet_text) > 140:
+        tweet_text = chat_complete(provider, system_prompt, user_content, temperature=0.75)
+        soft = get_max_post_chars()
+        if len(tweet_text) > soft:
             tweet_text = chat_complete(
                 provider,
-                INDUSTRY_TREND_SYSTEM_PROMPT,
-                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。140文字以内に収めてください。",
+                system_prompt,
+                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
                 temperature=0.5,
             )
         return enforce_linebreaks(tweet_text)
@@ -853,7 +971,8 @@ HASHTAGS = "#林業 #forest"
 def build_tweet_payload(tweet_text, article_url=None):
     """
     投稿本文を組み立てる（副作用なし）。
-    戻り値: (full_text, clean_body) またはエラー時は ValueError。
+    article_url は str または URL の list を受け付ける。
+    X Premium 前提でソフト上限 get_max_post_chars() のみ適用。
     """
     if not tweet_text:
         raise ValueError("投稿テキストが空です")
@@ -861,26 +980,33 @@ def build_tweet_payload(tweet_text, article_url=None):
     import re
     clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
     hashtag_str = HASHTAGS
+    urls = normalize_article_urls(article_url)
 
-    if article_url:
-        max_body = 104
+    # URLはX上で短縮カウントされるが、ソフト上限は最終テキスト長で見る
+    parts = [clean_body, hashtag_str]
+    if urls:
+        parts.extend(urls)
+    full_text = "\n".join(parts)
+
+    soft = get_max_post_chars()
+    if len(full_text) > soft:
+        # 本文だけ削る（URL・タグは残す）
+        overhead = len(hashtag_str) + 1 + sum(len(u) + 1 for u in urls)
+        max_body = max(50, soft - overhead)
         if len(clean_body) > max_body:
-            clean_body = clean_body[:max_body - 1] + "…"
-        full_text = f"{clean_body}\n{hashtag_str}\n{article_url}"
-    else:
-        max_body = 130
-        if len(clean_body) > max_body:
-            clean_body = clean_body[:max_body - 1] + "…"
-        full_text = f"{clean_body}\n{hashtag_str}"
+            clean_body = clean_body[: max_body - 1] + "…"
+        parts = [clean_body, hashtag_str]
+        if urls:
+            parts.extend(urls)
+        full_text = "\n".join(parts)
     return full_text, clean_body
 
 
 def post_to_x(tweet_text, article_url=None):
     """
     Xにツイートを投稿する。
-    - 本文の末尾に必ず HASHTAGS（#林業 #forest）を付ける
-    - article_urlがある場合はさらにURLを付ける
-    - X上でURLは23文字としてカウントされるため、本文はそれを考慮して制限する
+    - 末尾に HASHTAGS を付ける
+    - article_url（単一または複数）を末尾に付ける
     """
     try:
         full_text, _ = build_tweet_payload(tweet_text, article_url)
@@ -888,8 +1014,9 @@ def post_to_x(tweet_text, article_url=None):
         logger.error(str(e))
         return False
 
-    if article_url:
-        logger.info(f"記事URL付き投稿: {article_url}")
+    urls = normalize_article_urls(article_url)
+    if urls:
+        logger.info(f"記事URL付き投稿 ({len(urls)}件): {urls}")
 
     try:
         creds = get_x_credentials()
@@ -903,7 +1030,7 @@ def post_to_x(tweet_text, article_url=None):
         tweet_id = response.data['id']
         logger.info(f"投稿成功！ Tweet ID: {tweet_id}")
         logger.info(f"投稿内容: {full_text}")
-        logger.info(f"文字数(本文): {len(tweet_text)}")
+        logger.info(f"文字数(最終): {len(full_text)} / soft_max={get_max_post_chars()}")
         return True
     except Exception as e:
         logger.error(f"X投稿エラー: {e}")
@@ -912,11 +1039,12 @@ def post_to_x(tweet_text, article_url=None):
 
 def ensure_post_ready(tweet, article_url):
     """URL・本文・投稿成否を検査し、失敗時は RuntimeError を送出する。"""
-    if not article_url:
+    urls = normalize_article_urls(article_url)
+    if not urls:
         raise RuntimeError("記事URLが取得できないため投稿を中止しました")
     if not tweet:
         raise RuntimeError("投稿文を生成できませんでした")
-    if not post_to_x(tweet, article_url):
+    if not post_to_x(tweet, urls):
         raise RuntimeError("Xへの投稿に失敗しました")
 
 
@@ -926,9 +1054,16 @@ def print_draft_for_human(draft: dict):
     logger.info(f"DRAFT_ID: {draft['id']}")
     logger.info(f"SLOT: {draft['slot']}")
     logger.info(f"STATUS: {draft.get('status')}")
-    art = draft.get("article") or {}
-    logger.info(f"ARTICLE: {art.get('title')}")
-    logger.info(f"URL: {art.get('url')}")
+    sources = draft.get("sources") or []
+    if sources:
+        logger.info(f"SOURCES ({len(sources)}):")
+        for i, s in enumerate(sources, 1):
+            logger.info(f"  {i}. [{s.get('label') or s.get('source')}] {s.get('title')}")
+            logger.info(f"     {s.get('url')}")
+    else:
+        art = draft.get("article") or {}
+        logger.info(f"ARTICLE: {art.get('title')}")
+        logger.info(f"URL: {art.get('url')}")
     for provider in VALID_PROVIDERS:
         cand = (draft.get("candidates") or {}).get(provider) or {}
         logger.info("-" * 40)
@@ -936,7 +1071,8 @@ def print_draft_for_human(draft: dict):
         if cand.get("error"):
             logger.info(f"[{provider}] error: {cand['error']}")
         else:
-            logger.info(f"[{provider}] text:\n{cand.get('text')}")
+            text = cand.get("text") or ""
+            logger.info(f"[{provider}] chars={len(text)}\n{text}")
     logger.info("=" * 60)
     logger.info(
         "承認後の投稿例: CONFIRM_LIVE_POST=1 python forestry_bot.py approve "
@@ -944,13 +1080,13 @@ def print_draft_for_human(draft: dict):
     )
 
 
-def build_dual_candidates(title: str, snippet: str, generator):
-    """同一ネタで openai / grok の案を作る。失敗は error フィールドに残す。"""
+def build_dual_candidates(sources, generator):
+    """同一ネタ（複数ソース）で openai / grok の案を作る。"""
     candidates = {}
     for provider in VALID_PROVIDERS:
         model = get_openai_model() if provider == "openai" else get_grok_model()
         try:
-            text = generator(title, snippet, provider=provider)
+            text = generator(sources, provider=provider)
             if not text or not str(text).strip():
                 raise RuntimeError(f"{provider} が空の本文を返しました (model={model})")
             ok, flags = check_mislead_risk(text)
@@ -960,6 +1096,7 @@ def build_dual_candidates(title: str, snippet: str, generator):
                 "flags": flags,
                 "model": model,
                 "error": None,
+                "char_count": len(text),
             }
         except Exception as e:
             err = str(e)
@@ -970,31 +1107,42 @@ def build_dual_candidates(title: str, snippet: str, generator):
                 "flags": ["generation_error"],
                 "model": model,
                 "error": err,
+                "char_count": 0,
             }
     return candidates
 
 
-def create_dual_draft(slot: str, title: str, snippet: str, article_url: str, generator) -> dict:
-    if not article_url:
+def create_dual_draft(slot: str, sources, generator) -> dict:
+    urls = sources_as_urls(sources)
+    if not urls:
         raise RuntimeError("記事URLが取得できないため下書きを中止しました")
-    candidates = build_dual_candidates(title, snippet or "", generator)
+    candidates = build_dual_candidates(sources, generator)
     any_ok = any(
         (c.get("text") and not c.get("error")) for c in candidates.values()
     )
+    primary = sources[0]
     draft = {
         "id": new_draft_id(slot),
         "slot": slot,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "pending" if any_ok else "failed",
+        "sources": sources,
+        "urls": urls,
+        # 後方互換
         "article": {
-            "title": title,
-            "snippet": (snippet or "")[:500],
-            "url": article_url,
+            "title": primary.get("title"),
+            "snippet": (primary.get("snippet") or "")[:500],
+            "url": primary.get("url"),
+            "source": primary.get("source") or primary.get("label"),
         },
         "candidates": candidates,
+        "limits": {
+            "max_post_chars": get_max_post_chars(),
+            "max_sources": get_max_sources(),
+        },
     }
     path = save_draft(draft)
-    logger.info(f"下書きを保存しました: {path} status={draft['status']}")
+    logger.info(f"下書きを保存しました: {path} status={draft['status']} sources={len(sources)}")
     print_draft_for_human(draft)
     if not any_ok:
         errors = {p: (candidates[p] or {}).get("error") for p in VALID_PROVIDERS}
@@ -1006,64 +1154,43 @@ def create_dual_draft(slot: str, title: str, snippet: str, article_url: str, gen
 
 
 def collect_noon_article():
-    """昼12時用の記事を取得する。(title, snippet, url)"""
-    buzz_queries = [
-        "林業 国内 最新",
-        "木材 市場 国産材",
-        "森林 整備 政策",
-        "林野庁 新しい林業",
-        "木材利用 建築 国産材",
-        "林業 機械化 ドローン",
-        "森林経営計画 山村",
-        "国産材 活用 建築",
-        "林業 カーボンクレジット",
-        "木材価格 山林 市況",
-    ]
-    query = random.choice(buzz_queries)
-    logger.info(f"昼12時 国内農林業ニュース検索クエリ: {query}")
-    news, article_url = fetch_forestry_news(query)
-    title = query
-    snippet = news
-    if not (news and article_url):
-        logger.warning("ニュース取得不足。別クエリで再取得します。")
-        for fq in ["林業 最新", "国産材 活用", "木材 市場"]:
-            news2, url2 = fetch_forestry_news(fq, retry=False)
-            if news2 and url2:
-                title, snippet, article_url = fq, news2, url2
-                break
-    if not article_url:
-        raise RuntimeError("記事URLが取得できないため下書きを中止しました")
-    return title, snippet, article_url
+    """後方互換: 先頭ソースの (title, snippet, url) を返す。"""
+    sources = collect_noon_sources()
+    s = sources[0]
+    return s.get("title"), s.get("snippet"), s.get("url")
+
+
+def collect_noon_sources():
+    """昼12時: 国内農林業・木材系の複数ソース。"""
+    return collect_sources_from_catalog(NOON_SOURCE_QUERIES, "昼12時")
 
 
 def collect_evening_article():
-    """夜20時用の産業・経営トレンド記事を取得する。"""
-    title, snippet, article_url = fetch_todays_buzz_article()
-    if title and article_url:
-        return title, snippet, article_url
-    logger.warning("トレンド記事取得失敗。産業・経営系クエリで代替します。")
-    for fq in INDUSTRY_TREND_FALLBACK_QUERIES:
-        news2, url2 = fetch_forestry_news(fq, retry=False)
-        if news2 and url2:
-            return fq, news2, url2
-    raise RuntimeError("記事URLが取得できないため下書きを中止しました")
+    """後方互換。"""
+    sources = collect_evening_sources()
+    s = sources[0]
+    return s.get("title"), s.get("snippet"), s.get("url")
+
+
+def collect_evening_sources():
+    """夜20時: 産業・経営トレンドの複数ソース。"""
+    return collect_sources_from_catalog(EVENING_SOURCE_QUERIES, "夜20時")
 
 
 def noon_job():
     """昼12時: 下書きのみ（投稿しない）。"""
-    logger.info("=== 昼12時 下書き生成（OpenAI + Grok）===")
-    title, snippet, article_url = collect_noon_article()
-    return create_dual_draft("12:00", title, snippet, article_url, generate_buzz_insight_tweet)
+    logger.info("=== 昼12時 下書き生成（OpenAI + Grok / 複数ソース）===")
+    sources = collect_noon_sources()
+    return create_dual_draft("12:00", sources, generate_buzz_insight_tweet)
 
 
 def pre_evening_job():
     """夜20時: 下書きのみ（投稿しない）。"""
-    logger.info("=== 夜20時 下書き生成（OpenAI + Grok）===")
-    title, snippet, article_url = collect_evening_article()
-    logger.info(f"取得記事: {title}")
-    return create_dual_draft(
-        "20:00", title, snippet, article_url, generate_industry_trend_tweet
-    )
+    logger.info("=== 夜20時 下書き生成（OpenAI + Grok / 複数ソース）===")
+    sources = collect_evening_sources()
+    for s in sources:
+        logger.info(f"取得: [{s.get('label')}] {s.get('title')}")
+    return create_dual_draft("20:00", sources, generate_industry_trend_tweet)
 
 
 def approve_and_post(draft_id: str, provider: str):
@@ -1079,7 +1206,10 @@ def approve_and_post(draft_id: str, provider: str):
 
     cand = (draft.get("candidates") or {}).get(provider) or {}
     tweet = cand.get("text")
-    url = (draft.get("article") or {}).get("url")
+    urls = draft.get("urls") or sources_as_urls(draft.get("sources") or [])
+    if not urls:
+        url = (draft.get("article") or {}).get("url")
+        urls = normalize_article_urls(url)
     if not tweet:
         raise RuntimeError(f"{provider} の投稿案がありません: {cand.get('error')}")
     if cand.get("guard_ok") is False:
@@ -1088,9 +1218,9 @@ def approve_and_post(draft_id: str, provider: str):
             "CONFIRM_LIVE_POST=1 でも続行しますが、内容を再確認してください。"
         )
 
-    ensure_post_ready(tweet, url)
+    ensure_post_ready(tweet, urls)
     mark_draft_posted(draft_id, provider)
-    logger.info(f"承認投稿完了: draft={draft_id} provider={provider}")
+    logger.info(f"承認投稿完了: draft={draft_id} provider={provider} urls={len(urls)}")
 
 
 # 互換: 旧ジョブ名は下書きのみ（実投稿しない）
