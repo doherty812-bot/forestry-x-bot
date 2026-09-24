@@ -2,15 +2,13 @@
 
 岸本一夫さんのXアカウント向けに、林業関連の投稿を自動生成・投稿するボットです。
 
-## 現状（引継ぎキックオフ後）
+## 現状（定期投稿再開）
 
-- GitHub Actions の **「林業X自動投稿」は Disable 済み**（定期実行なし）
-- ワークフロー定義から `schedule` を外し、`workflow_dispatch` のみ
-- ソースコードに X 認証情報の既定値は **置かない**（環境変数必須）
-- 記事URL未取得・投稿失敗時は **非ゼロ終了**（Actions を赤くする）
-- 実投稿CLIは `CONFIRM_LIVE_POST=1` が必要
-
-再開前チェックリストは `CURSOR_HANDOVER.md` を参照してください。
+- `post.yml` に cron 復帰済み（JST 12:00 / 20:00 = UTC `0 3 * * *` / `0 11 * * *`）
+- **GitHub UI で workflow を Enable しないと動かない**（Disable のままだと cron も無効）
+- 手動 `workflow_dispatch` は `confirm_live_post=true` が必要（schedule は自動許可）
+- ソースに X 認証の既定値は置かない（環境変数 / Secrets 必須）
+- 記事URL未取得・投稿失敗時は非ゼロ終了
 
 ## スタック
 
