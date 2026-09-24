@@ -35,12 +35,34 @@ jobs:
       - name: 下書きを生成（投稿しない）
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # 空の Secret が渡ると SDK が壊れるため、未使用時は変数自体を渡さない方針。
+          # 互換 URL が必要なときだけ OPENAI_BASE_URL Secret を設定する。
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          GROK_MODEL: ${{ secrets.GROK_MODEL }}
         run: |
+          # モデル名: Secret が空文字のときはコード側既定値を使うため、空なら unset
+          if [ -n "${{ secrets.OPENAI_MODEL }}" ]; then
+            export OPENAI_MODEL="${{ secrets.OPENAI_MODEL }}"
+          fi
+          if [ -n "${{ secrets.GROK_MODEL }}" ]; then
+            export GROK_MODEL="${{ secrets.GROK_MODEL }}"
+          fi
+          if [ -n "${{ secrets.XAI_BASE_URL }}" ]; then
+            export XAI_BASE_URL="${{ secrets.XAI_BASE_URL }}"
+          fi
+          # 空の OPENAI_BASE_URL は unset（公式エンドポイントへ）
+          if [ -z "${OPENAI_BASE_URL}" ]; then
+            unset OPENAI_BASE_URL
+          fi
+          if [ -z "${XAI_API_KEY}" ] && [ -z "${GROK_API_KEY}" ]; then
+            echo "XAI_API_KEY または GROK_API_KEY が未設定です" >&2
+            exit 1
+          fi
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "OPENAI_API_KEY が未設定です" >&2
+            exit 1
+          fi
           if [ -n "${{ github.event.inputs.slot }}" ]; then
             SLOT="${{ github.event.inputs.slot }}"
           else
@@ -52,6 +74,8 @@ jobs:
             esac
           fi
           echo "下書きスロット: $SLOT（X投稿は行いません）"
+          echo "OPENAI_MODEL=${OPENAI_MODEL:-<code-default>}"
+          echo "GROK_MODEL=${GROK_MODEL:-<code-default>}"
           python forestry_bot.py draft "$SLOT"
 
       - name: 下書きアーティファクトを保存
