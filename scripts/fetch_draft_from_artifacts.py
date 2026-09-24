@@ -81,7 +81,34 @@ def _api_request(url: str, token: str) -> Any:
         raise RuntimeError(f"GitHub API 失敗 {e.code} {url}: {body}") from e
 
 
+class _StripAuthOnRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    GitHub artifact ZIP は api.github.com → Azure Blob へ 302 する。
+    urllib 既定は Authorization を redirect 先へ持ち越すため、
+    SAS 付き Azure URL が 401 になる。redirect 先では Auth を外す。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        # Request.remove_header は headers / unredirected_hdrs の両方を消す
+        for name in ("Authorization", "X-GitHub-Api-Version"):
+            try:
+                new_req.remove_header(name)
+            except KeyError:
+                pass
+        return new_req
+
+
+def _download_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_StripAuthOnRedirectHandler)
+
+
 def _download_bytes(url: str, token: str) -> bytes:
+    """
+    artifact 等をダウンロードする。初回は Bearer、redirect 先では Auth なし。
+    """
     req = urllib.request.Request(
         url,
         headers={
@@ -91,8 +118,13 @@ def _download_bytes(url: str, token: str) -> bytes:
             "User-Agent": "forestry-x-bot-fetch-draft",
         },
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return resp.read()
+    opener = _download_opener()
+    try:
+        with opener.open(req, timeout=120) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"ダウンロード失敗 {e.code} {url}: {body}") from e
 
 
 def list_workflow_runs(
