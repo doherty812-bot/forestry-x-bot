@@ -10,6 +10,7 @@ from unittest.mock import patch
 import draft_store
 import forestry_bot as bot
 from mislead_guard import check_mislead_risk
+from privacy_guard import check_privacy_risk, KNOWN_FULL_NAME_TOKENS
 
 
 class TestEnforceLinebreaks(unittest.TestCase):
@@ -59,6 +60,43 @@ class TestMisleadGuard(unittest.TestCase):
     def test_allows_hedged_comment(self):
         ok, flags = check_mislead_risk(
             "工場との値段交渉は、現場ごとに温度差があります。\n焦らず様子を見ています。"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(flags, [])
+
+
+class TestPrivacyGuard(unittest.TestCase):
+    def test_flags_full_name(self):
+        name = KNOWN_FULL_NAME_TOKENS[0]
+        ok, flags = check_privacy_risk(f"私は{name}です。現場を見ています。")
+        self.assertFalse(ok)
+        self.assertTrue(any("pii_full_name" in f for f in flags))
+
+    def test_flags_email_and_gmail(self):
+        ok, flags = check_privacy_risk("連絡は example.user@gmail.com まで。")
+        self.assertFalse(ok)
+        self.assertIn("pii_email", flags)
+
+    def test_flags_phone(self):
+        ok, flags = check_privacy_risk("電話は 025-123-4567 です。")
+        self.assertFalse(ok)
+        self.assertTrue(any("pii_phone" in f for f in flags))
+
+    def test_flags_office_token(self):
+        ok, flags = check_privacy_risk("事務所に問い合わせください。")
+        self.assertFalse(ok)
+        self.assertTrue(any("pii_office_contact" in f for f in flags))
+
+    def test_allows_business_name_without_office(self):
+        ok, flags = check_privacy_risk(
+            "有限会社丸実として工場向け販売を続けます。\n私は現場でこのように考えます。"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(flags, [])
+
+    def test_allows_normal_field_comment(self):
+        ok, flags = check_privacy_risk(
+            "1,500haの計画を軸に、人手不足へは機械化で応えます。\n私はこのように進めます。"
         )
         self.assertTrue(ok)
         self.assertEqual(flags, [])
@@ -159,12 +197,49 @@ class TestIndustryTrendPolicy(unittest.TestCase):
         self.assertIn("ミスリード防止", prompt)
         self.assertIn("Premium", prompt)
 
+    def test_system_prompt_has_privacy_guard(self):
+        prompt = bot._industry_system_prompt()
+        self.assertIn("個人情報・連絡先", prompt)
+        self.assertIn("氏名フル", prompt)
+        self.assertIn("事務所", prompt)
+        self.assertIn(bot.PRIVACY_GUARD_PROMPT.strip().splitlines()[0], prompt)
+
+    def test_noon_system_prompt_has_privacy_guard(self):
+        sources = [{"title": "題", "snippet": "概要", "url": "https://ex.com", "label": "x"}]
+        captured = {}
+
+        def fake_chat(provider, system_prompt, user_content, temperature=0.75):
+            captured["system"] = system_prompt
+            captured["user"] = user_content
+            return "私は現場でこのように考えます。\n#林業 #森林 #forest"
+
+        with patch.object(bot, "chat_complete", side_effect=fake_chat):
+            bot.generate_buzz_insight_tweet(
+                sources,
+                provider="openai",
+                obsidian_context={"text": "", "status": "missing", "path": None, "files_used": [], "warning": "x"},
+            )
+        self.assertIn("個人情報・連絡先", captured["system"])
+        self.assertIn("氏名フル・メール・事務所", captured["user"])
+
     def test_system_prompt_first_person_not_reader_questions(self):
         prompt = bot._industry_system_prompt()
         self.assertIn("一人称", prompt)
         self.assertIn("問いかけは禁止", prompt)
         self.assertIn("私は〜と考えます", prompt)
         self.assertIn(bot.VOICE_FIRST_PERSON_PROMPT.strip().splitlines()[0], prompt)
+
+    def test_dual_candidates_merge_privacy_flags(self):
+        name = KNOWN_FULL_NAME_TOKENS[0]
+
+        def gen(sources, provider="openai"):
+            return f"{provider}: 私は{name}です。現場を見ています。"
+
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        cands = bot.build_dual_candidates(sources, gen)
+        for p in ("openai", "grok"):
+            self.assertFalse(cands[p]["guard_ok"])
+            self.assertTrue(any("pii_full_name" in f for f in cands[p]["flags"]))
 
 
 class TestObsidianContext(unittest.TestCase):

@@ -30,6 +30,7 @@ import schedule
 import json
 
 from mislead_guard import MISLEAD_GUARD_PROMPT, check_mislead_risk
+from privacy_guard import PRIVACY_GUARD_PROMPT, check_privacy_risk
 from draft_store import (
     list_drafts,
     load_draft,
@@ -349,7 +350,9 @@ def format_obsidian_for_prompt(obsidian: dict | None) -> str:
         "【Obsidian メモ（下書き前に参照したノート。口調・関心・方針の手がかり）】\n"
         f"vault={obsidian.get('path')} files={len(files)}\n"
         f"{obsidian['text']}\n"
-        "上記メモの事実を捏造で広げず、自分の考えを述べるときの背景にしてください。"
+        "上記メモの事実を捏造で広げず、自分の考えを述べるときの背景にしてください。\n"
+        "メモ内の氏名フル・メール・事務所住所／電話／連絡先は投稿本文に転記しないでください。"
+        "屋号は必要最小限のみ（迷ったら載せない）。"
     )
 
 
@@ -1088,6 +1091,8 @@ def generate_buzz_insight_tweet(
 
 {MISLEAD_GUARD_PROMPT}
 
+{PRIVACY_GUARD_PROMPT}
+
 【構成】
 1. 複数ソースのテーマを自分の言葉で（短く）
 2. 現場目線のコメント（2〜4文程度でも可）
@@ -1106,6 +1111,7 @@ def generate_buzz_insight_tweet(
 以下の国内農林業・木材関連ソース（{n}件）を踏まえて投稿を作成してください。
 価格・相場は根拠が無い限り断定しないでください。
 読者への問いかけはせず、一人称の意志で締めてください。
+氏名フル・メール・事務所住所／電話は本文に書かないでください。
 
 {format_sources_for_prompt(sources)}
 
@@ -1146,6 +1152,8 @@ def _industry_system_prompt():
 
 {MISLEAD_GUARD_PROMPT}
 
+{PRIVACY_GUARD_PROMPT}
+
 【構成】
 1. 複数トレンドの要点
 2. 林業・森林経営への示唆（必須）
@@ -1184,6 +1192,7 @@ def generate_industry_trend_tweet(
 国内農林業ニュースの要約だけにしないでください。
 林業経営への読み替えを必ず含め、複数ソースに触れてください。
 読者への問いかけはせず、一人称の意志で締めてください。
+氏名フル・メール・事務所住所／電話は本文に書かないでください。
 
 {format_sources_for_prompt(sources)}
 
@@ -1332,7 +1341,14 @@ def build_dual_candidates(sources, generator):
             text = generator(sources, provider=provider)
             if not text or not str(text).strip():
                 raise RuntimeError(f"{provider} が空の本文を返しました (model={model})")
-            ok, flags = check_mislead_risk(text)
+            ok_m, flags_m = check_mislead_risk(text)
+            ok_p, flags_p = check_privacy_risk(text)
+            # empty_text は mislead 側と重複しうるので privacy 側を優先マージ
+            flags = list(flags_m)
+            for f in flags_p:
+                if f not in flags:
+                    flags.append(f)
+            ok = ok_m and ok_p
             candidates[provider] = {
                 "text": text,
                 "guard_ok": ok,
@@ -1483,8 +1499,9 @@ def approve_and_post(draft_id: str, provider: str):
         raise RuntimeError(f"{provider} の投稿案がありません: {cand.get('error')}")
     if cand.get("guard_ok") is False:
         logger.warning(
-            f"ミスリード警告フラグあり: {cand.get('flags')} — "
+            f"投稿前警告フラグあり（ミスリード／個人情報など）: {cand.get('flags')} — "
             "CONFIRM_LIVE_POST=1 でも続行しますが、内容を再確認してください。"
+            "氏名・メール・事務所連絡先が本文に無いことを特に確認してください。"
         )
 
     ensure_post_ready(tweet, urls)
@@ -1579,7 +1596,13 @@ if __name__ == "__main__":
         logger.info("dry-run-format OK")
     elif cmd == "check-mislead":
         sample = args[1] if len(args) > 1 else "木材価格が高騰しています。"
-        ok, flags = check_mislead_risk(sample)
+        ok_m, flags_m = check_mislead_risk(sample)
+        ok_p, flags_p = check_privacy_risk(sample)
+        flags = list(flags_m)
+        for f in flags_p:
+            if f not in flags:
+                flags.append(f)
+        ok = ok_m and ok_p
         logger.info(f"ok={ok} flags={flags} text={sample}")
     else:
         logger.info(
