@@ -11,22 +11,56 @@ import draft_store
 import forestry_bot as bot
 from mislead_guard import check_mislead_risk
 from privacy_guard import check_privacy_risk, KNOWN_FULL_NAME_TOKENS
+from prose_guard import check_prose_risk, normalize_prose_breaks, MAX_SENTENCE_CHARS
 
 
-class TestEnforceLinebreaks(unittest.TestCase):
-    def test_inserts_newline_after_period(self):
+class TestNormalizeProseBreaks(unittest.TestCase):
+    def test_does_not_force_newline_after_period(self):
         text = "一文です。二文です。"
         out = bot.enforce_linebreaks(text)
-        self.assertIn("。\n", out)
+        self.assertEqual(out, "一文です。二文です。")
+        self.assertNotIn("。\n", out)
+
+    def test_joins_one_sentence_per_line(self):
+        text = "一文です。\n二文です。\n三文です。"
+        out = normalize_prose_breaks(text)
+        self.assertEqual(out, "一文です。二文です。三文です。")
+
+    def test_keeps_paragraph_break_between_dense_blocks(self):
+        text = "一段落の一文です。続く二文です。\n\n二段落の一文です。続く二文です。"
+        out = normalize_prose_breaks(text)
+        self.assertIn("\n\n", out)
+        self.assertEqual(out.count("\n\n"), 1)
+
+    def test_collapses_extra_blank_lines(self):
+        # 連続空行は圧縮され、短い一文段落どうしは密度のため結合される
+        text = "前です。\n\n\n\n後です。"
+        out = normalize_prose_breaks(text)
+        self.assertEqual(out, "前です。後です。")
+        self.assertNotIn("\n\n\n", out)
+
+    def test_merges_sparse_single_sentence_paragraphs(self):
+        text = "一文です。\n\n二文です。\n\n三文です。"
+        out = normalize_prose_breaks(text)
+        self.assertNotIn("\n\n", out)
+        self.assertEqual(out, "一文です。二文です。三文です。")
+
+    def test_does_not_join_hashtag_line(self):
+        text = "本文です。次です。\n#林業 #森林 #forest"
+        out = normalize_prose_breaks(text)
+        self.assertIn("#林業", out)
+        self.assertTrue(out.endswith("#林業 #森林 #forest"))
 
 
 class TestBuildTweetPayload(unittest.TestCase):
     def test_url_and_hashtags(self):
         body = "山を経営資源として見る視点が大切です。\n現場の感覚も忘れません。"
         url = "https://news.google.com/articles/example"
-        full, _ = bot.build_tweet_payload(body, url)
+        full, clean = bot.build_tweet_payload(body, url)
         self.assertIn(bot.HASHTAGS, full)
         self.assertIn(url, full)
+        # 1文1行は結合される
+        self.assertEqual(clean, "山を経営資源として見る視点が大切です。現場の感覚も忘れません。")
 
     def test_multiple_urls(self):
         body = "複数ソースを踏まえたコメントです。"
@@ -100,6 +134,40 @@ class TestPrivacyGuard(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertEqual(flags, [])
+
+
+class TestProseGuard(unittest.TestCase):
+    def test_flags_long_sentence(self):
+        long = "あ" * (MAX_SENTENCE_CHARS + 5) + "。"
+        ok, flags = check_prose_risk(long)
+        self.assertTrue(ok)  # 承認はブロックしない
+        self.assertTrue(any(f.startswith("long_sentence:") for f in flags))
+
+    def test_flags_excessive_linebreaks(self):
+        text = "一文です。\n二文です。\n三文です。\n四文です。"
+        ok, flags = check_prose_risk(text)
+        self.assertTrue(ok)
+        self.assertIn("excessive_linebreaks", flags)
+
+    def test_allows_dense_short_prose(self):
+        text = "現場の感覚を大事にします。私は機械化で人手不足に応えます。"
+        ok, flags = check_prose_risk(text)
+        self.assertTrue(ok)
+        self.assertEqual(flags, [])
+
+    def test_dual_candidates_keeps_prose_flags_without_failing_guard(self):
+        sparse = "一文です。\n二文です。\n三文です。\n四文です。"
+
+        def gen(sources, provider="openai"):
+            return sparse
+
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        cands = bot.build_dual_candidates(sources, gen)
+        for p in ("openai", "grok"):
+            self.assertTrue(cands[p]["guard_ok"])
+            self.assertIn("excessive_linebreaks", cands[p]["flags"])
+            # 保存本文は正規化済み
+            self.assertNotIn("\n", cands[p]["text"])
 
 
 class TestLivePostGuard(unittest.TestCase):
@@ -228,6 +296,16 @@ class TestIndustryTrendPolicy(unittest.TestCase):
         self.assertIn("問いかけは禁止", prompt)
         self.assertIn("私は〜と考えます", prompt)
         self.assertIn(bot.VOICE_FIRST_PERSON_PROMPT.strip().splitlines()[0], prompt)
+
+    def test_system_prompt_mobile_prose_rules(self):
+        prompt = bot._industry_system_prompt()
+        self.assertIn("スマホ向け", prompt)
+        self.assertIn("改行を取りすぎない", prompt)
+        self.assertIn("1文ごとに行をバラさない", prompt)
+        self.assertIn("短め", prompt)
+        voice = bot.VOICE_FIRST_PERSON_PROMPT
+        self.assertIn("改行を取りすぎない", voice)
+        self.assertNotIn("1文ごとに改行", voice)
 
     def test_dual_candidates_merge_privacy_flags(self):
         name = KNOWN_FULL_NAME_TOKENS[0]
