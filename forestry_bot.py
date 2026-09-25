@@ -31,6 +31,7 @@ import json
 
 from mislead_guard import MISLEAD_GUARD_PROMPT, check_mislead_risk
 from privacy_guard import PRIVACY_GUARD_PROMPT, check_privacy_risk
+from prose_guard import check_prose_risk, normalize_prose_breaks
 from draft_store import (
     list_drafts,
     load_draft,
@@ -94,7 +95,7 @@ DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\Obsidian Vault"
 # Actions 向け: リポジトリ内の同期先（方法1: 公開可 .md を obsidian/ にコミット。中身があれば最優先）
 REPO_OBSIDIAN_DIRS = ("obsidian", "vault-sync")
 
-# OpenAI / Grok 共通: 読者問いかけをやめ、一人称の意志を出す
+# OpenAI / Grok 共通: 一人称の意志 + スマホ向け読みやすさ
 VOICE_FIRST_PERSON_PROMPT = """
 【文体・一人称の意志（最重要・両モデル共通）】
 ・読者への問いかけは禁止する（例: 「皆さんは〜？」「どう思いますか」「皆様の現場では」「どのようにお考えですか」）
@@ -102,7 +103,12 @@ VOICE_FIRST_PERSON_PROMPT = """
 ・締めは問いかけではなく、自分の考え・方針・これからやることの一文にする
 ・「です」「ます」調。禁止語尾: 「〜だろう」「〜だな」「〜かな」「〜ですな」
 ・絵文字なし。硬い「〜が重要です」「〜を推進します」は避ける
-・1文ごとに改行（句点「。」の後は改行）
+
+【スマホ向けの読みやすさ（両モデル共通）】
+・1文は短めにする（目安40文字前後。極端に長い一文は避ける）
+・改行を取りすぎない。1文ごとに行をバラさない
+・意味のある段落の区切りだけ空行を使い、段落内は続けて書く
+・スマホ画面でスカスカにならない密度とリズムにする
 """
 
 
@@ -447,30 +453,16 @@ def require_live_post_confirmation():
             "意図した実投稿の場合のみ CONFIRM_LIVE_POST=1 を設定してください。"
         )
 # =========================================================
-# 改行後処理：句点の後に必ず改行を入れる
+# 改行後処理：スマホ向けに不要な改行を抑える
 # =========================================================
 def enforce_linebreaks(text):
     """
-    句点「。」の後に改行がない場合、強制的に改行を挿入する。
-    また、行末の全角スペースや半角スペースを除去する。
+    互換エイリアス。normalize_prose_breaks に委譲する。
+
+    旧実装は句点ごとに改行を挿入していたが、スマホでスカスカになるため廃止。
+    意味のある段落分けは残し、1文1行のバラし・連続空行を正規化する。
     """
-    import re
-    # 句点の後に改行がない場合、改行を挿入（ハッシュタグ行の直前は除く）
-    text = re.sub(r'。(?!\n)(?!$)', '。\n', text)
-    # 行末の空白を除去
-    lines = [line.rstrip() for line in text.split('\n')]
-    # 空行が連続する場合は1つにまとめる
-    result = []
-    prev_empty = False
-    for line in lines:
-        if line == '':
-            if not prev_empty:
-                result.append(line)
-            prev_empty = True
-        else:
-            result.append(line)
-            prev_empty = False
-    return '\n'.join(result).strip()
+    return normalize_prose_breaks(text)
 
 
 # =========================================================
@@ -889,33 +881,30 @@ def generate_tweet(category, topic, news_context=""):
 ・地方の人口減少・人手不足を冷静に見据えている
 
 【文体の特徴（最重要）】
-・1文ごとに必ず改行する。句点「。」の後は必ず改行すること
-・短文・中文中心（1文あたり20〜40文字程度）
-・「です」「ます」調を基本とする。語尾は「〜です。」「〜ます。」「〜ですね。」「〜でしょうか。」「〜かもしれません。」など
+・短文中心（1文あたり20〜40文字程度）。極端に長い一文は避ける
+・改行を取りすぎない。1文ごとに行をバラさない。段落内は続けて書く
+・意味のある段落だけ空行で区切り、スマホで読みやすい密度にする
+・「です」「ます」調を基本とする
 ・体言止めを適度に混ぜる
-・「...」で余韻・沈黙を表現することがある
 ・絵文字は使わない
 ・「〜だろう」「〜だな」「〜かな」「〜ですな」などの語尾は使わない
+・読者への問いかけは禁止。一人称の意志で締める
 ・スマートで知性的な口調を保ちつつ、押しつけがましくない
 
 【実際の投稿例（この文体を参考にすること）】
 例1：
-「今日も生産森林組合さんとの山歩き。
-エリートツリーの成長も実感出来たようで良かったです。
-週末に山主さんとの山歩きをしていると、清々しいような、時間が無くなるような微妙な心境で新年度も精進していきます。」
+「今日も生産森林組合さんとの山歩き。エリートツリーの成長も実感出来たようで良かったです。週末の山歩きは清々しく、新年度も精進していきます。」
 
 例2：
-「学校や公共施設への木材活用が進まないと、行政はなかなか動きません。
-里山整備と災害対策、同時に進める必要があります。」
+「学校や公共施設への木材活用が進まないと、行政はなかなか動きません。里山整備と災害対策を同時に進める必要があります。私は現場からこう進めます。」
 
 例3：
-「森林が侵食され、山にはゴミが残ります。
-原子力発電の廃棄物問題よりも、ずっと身近な問題になるかもしれません。」
+「森林が侵食され、山にはゴミが残ります。原発廃棄物より身近な問題かもしれません。私は身近な山から手を付けます。」
 
 【投稿の構成】
 1. 事実・問題提起（短く）
 2. 背景・理由・自分の見方
-3. 一言コメントまたは問いかけ（押しつけがましくない）
+3. 一人称の意志・方針（問いかけ禁止）
 
 【厳守事項】
 ・文字数は全体で140文字以内（ハッシュタグ・改行含む）
@@ -979,22 +968,21 @@ def generate_global_buzz_tweet(query, articles):
 日本の林業への示唆や自分の視点を一言添える。
 
 【文体の特徴（最重要）】
-・1文ごとに必ず改行する。句点「。」の後は必ず改行すること
-・短文・中文中心（1文あたり20〜40文字程度）
-・「です」「ます」調を基本とする。語尾は「〜です。」「〜ます。」「〜ですね。」「〜でしょうか。」「〜かもしれません。」など
+・短文中心（1文あたり20〜40文字程度）。極端に長い一文は避ける
+・改行を取りすぎない。1文ごとに行をバラさない。段落内は続けて書く
+・意味のある段落だけ空行で区切り、スマホで読みやすい密度にする
+・「です」「ます」調を基本とする
 ・「海外では〜」「世界では〜」などの書き出しで海外情報であることを明示する
-・最後に日本の林業経営への示唠や自分のコメントを一言添える
+・最後に日本の林業経営への示唆を一人称で一言添える（問いかけ禁止）
 ・「〜だろう」「〜だな」「〜かな」「〜ですな」などの語尾は使わない
 ・スマートで知性的な口調を保ちつつ、押しつけがましくない
 ・絵文字は使わない
 ・AIが書いたような「〜が期待されています」「〜を推進します」などの硬い表現は避ける
 
 【実際の投稿例（この文体を参考にすること）】
-「森林が侵され、そして山にはゴミが残る。
-原子力発電のゴミ問題よりも身近になるだろう。」
+「海外では森林侵食とゴミ投棄がセットで報じられています。原発廃棄物より身近な問題かもしれません。私は日本の山でも同じ兆候を警戒します。」
 
-「学校とか公共施設に出始めないと、行政は動かない。
-里山整備もやりながら、同時に災害対策を進めていかないと状況が悪化する。」
+「海外では公共施設の木材利用が行政を動かしています。里山整備と災害対策を同時に進めないと状況が悪化します。私は現場からこう考えます。」
 
 【厳守事項】
 ・文字数は全体で140文字以内（ハッシュタグ・改行含む）
@@ -1128,7 +1116,7 @@ def generate_buzz_insight_tweet(
                 user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
                 temperature=0.5,
             )
-        return enforce_linebreaks(tweet_text)
+        return tweet_text.strip()
     except Exception as e:
         logger.error(f"国内農林業インサイトツイート生成エラー ({provider}): {e}")
         raise
@@ -1209,7 +1197,7 @@ def generate_industry_trend_tweet(
                 user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
                 temperature=0.5,
             )
-        return enforce_linebreaks(tweet_text)
+        return tweet_text.strip()
     except Exception as e:
         logger.error(f"産業・経営トレンドツイート生成エラー ({provider}): {e}")
         raise
@@ -1231,6 +1219,7 @@ def build_tweet_payload(tweet_text, article_url=None):
 
     import re
     clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
+    clean_body = normalize_prose_breaks(clean_body)
     hashtag_str = HASHTAGS
     urls = normalize_article_urls(article_url)
 
@@ -1341,11 +1330,17 @@ def build_dual_candidates(sources, generator):
             text = generator(sources, provider=provider)
             if not text or not str(text).strip():
                 raise RuntimeError(f"{provider} が空の本文を返しました (model={model})")
+            # 文体 flags は正規化前（1文1行バラし等）を見る
+            _, flags_prose = check_prose_risk(text)
+            text = normalize_prose_breaks(text)
             ok_m, flags_m = check_mislead_risk(text)
             ok_p, flags_p = check_privacy_risk(text)
             # empty_text は mislead 側と重複しうるので privacy 側を優先マージ
             flags = list(flags_m)
             for f in flags_p:
+                if f not in flags:
+                    flags.append(f)
+            for f in flags_prose:
                 if f not in flags:
                     flags.append(f)
             ok = ok_m and ok_p
@@ -1598,8 +1593,12 @@ if __name__ == "__main__":
         sample = args[1] if len(args) > 1 else "木材価格が高騰しています。"
         ok_m, flags_m = check_mislead_risk(sample)
         ok_p, flags_p = check_privacy_risk(sample)
+        _, flags_prose = check_prose_risk(sample)
         flags = list(flags_m)
         for f in flags_p:
+            if f not in flags:
+                flags.append(f)
+        for f in flags_prose:
             if f not in flags:
                 flags.append(f)
         ok = ok_m and ok_p
