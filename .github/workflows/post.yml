@@ -19,6 +19,9 @@ on:
 jobs:
   draft:
     runs-on: ubuntu-latest
+    outputs:
+      draft_id: ${{ steps.draft_meta.outputs.draft_id }}
+      slot: ${{ steps.draft_meta.outputs.slot }}
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
@@ -33,6 +36,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: 下書きを生成（投稿しない）
+        id: generate
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # 空の Secret が渡ると SDK が壊れるため、未使用時は変数自体を渡さない方針。
@@ -91,7 +95,29 @@ jobs:
           echo "GROK_MODEL=${GROK_MODEL:-<code-default>}"
           echo "OBSIDIAN_VAULT_PATH=${OBSIDIAN_VAULT_PATH:-<unset>}"
           echo "OBSIDIAN_MISSING_POLICY=${OBSIDIAN_MISSING_POLICY}"
+          echo "SLOT=$SLOT" >> "$GITHUB_ENV"
           python forestry_bot.py draft "$SLOT"
+
+      - name: draft_id を出力
+        id: draft_meta
+        run: |
+          SLOT="${SLOT:-}"
+          if [ -z "$SLOT" ]; then
+            if [ -n "${{ github.event.inputs.slot }}" ]; then
+              SLOT="${{ github.event.inputs.slot }}"
+            else
+              SLOT="12:00"
+            fi
+          fi
+          f=$(ls -1 drafts/*.json 2>/dev/null | sort | tail -1 || true)
+          if [ -z "$f" ]; then
+            echo "下書き JSON がありません" >&2
+            exit 1
+          fi
+          DID=$(basename "$f" .json)
+          echo "draft_id=$DID" >> "$GITHUB_OUTPUT"
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "DRAFT_ID=$DID（スロット $SLOT）"
 
       - name: 下書きアーティファクトを保存
         uses: actions/upload-artifact@v4
@@ -99,3 +125,49 @@ jobs:
           name: forestry-drafts
           path: drafts/*.json
           if-no-files-found: warn
+
+  # 下書き成功後: Cursor Cloud Agent を起動し、スマホアプリにレビュー会話を出す。
+  # X 投稿はしない。CURSOR_API_KEY 未設定時は警告のみで draft 自体は成功のまま。
+  notify-cursor:
+    name: Cursor へ下書き通知
+    needs: draft
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cloud Agent を起動（レビュー用・投稿なし）
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_AGENT_MODEL: ${{ vars.CURSOR_AGENT_MODEL }}
+          CURSOR_AGENT_API_VERSION: ${{ vars.CURSOR_AGENT_API_VERSION }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -z "${CURSOR_AGENT_API_VERSION}" ]; then
+            unset CURSOR_AGENT_API_VERSION
+          fi
+          if [ -z "${CURSOR_AGENT_MODEL}" ]; then
+            unset CURSOR_AGENT_MODEL
+          fi
+          python scripts/launch_draft_review_agent.py \
+            --draft-id "${{ needs.draft.outputs.draft_id }}" \
+            --slot "${{ needs.draft.outputs.slot }}" \
+            --run-id "${{ github.run_id }}" \
+            --soft-fail
+          {
+            echo "## Cursor スマホ通知"
+            echo ""
+            echo "- DRAFT_ID: \`${{ needs.draft.outputs.draft_id }}\`"
+            echo "- スロット: ${{ needs.draft.outputs.slot }}"
+            echo "- 起動スクリプト: \`scripts/launch_draft_review_agent.py\`"
+            echo "- Secret: \`CURSOR_API_KEY\`（未設定ならこのステップは警告のみ）"
+            echo "- 手順: Project docs \`cursor-mobile-draft-notify.md\`"
+          } >> "$GITHUB_STEP_SUMMARY"
