@@ -4,15 +4,16 @@
 岸本一夫さんのXアカウント向け
 
 運用:
-  1) draft 12:00 / 20:00 で OpenAI と Grok の二系統案を生成（投稿しない）
+  1) draft 12:00 / 20:00 で OpenAI と Grok の二系統スレッド案を生成（投稿しない）
   2) Cursor 等で人間が確認・選択
   3) CONFIRM_LIVE_POST=1 付きで approve <draft_id> <openai|grok> のみ投稿
+     （reply 連鎖のスレッド。画像があれば soft-fail 付きで添付）
 
 時間帯別コンテンツ:
-  昼12時 : 国内農林業ニュース（複数ソース）× 実務コメント
-  夜20時 : 産業・経営トレンド（複数ソース）× 林業経営への示唆
+  昼12時 : 国内農林業ニュース（複数ソース）× 実務コメント（スレッド）
+  夜20時 : 産業・経営トレンド（複数ソース）× 林業経営への示唆（スレッド）
 
-X Premium 前提で長文可（既定ソフト上限 8000 文字、MAX_POST_CHARS で変更）。
+1投稿の壁テキスト（例: 623文字一発）は作らない。短いポストの一連（スレッド）にする。
 schedule は下書き生成のみ。即時ライブ投稿は行わない。
 """
 
@@ -21,7 +22,11 @@ import random
 import time
 import logging
 import inspect
+import re
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 import tweepy
 from openai import OpenAI
 import requests
@@ -81,10 +86,14 @@ _grok_client = None
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_GROK_MODEL = "grok-3-mini"
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-# X Premium 前提。公式上限は大きいが、運用上のソフト上限（env で変更可）
+# スレッド各ポストのソフト上限（壁テキスト禁止。env で変更可）
+DEFAULT_MAX_CHARS_PER_POST = 260
+# 後方互換: 旧「1投稿全体」上限。スレッド合計のソフト上限としても参照
 DEFAULT_MAX_POST_CHARS = 8000
+DEFAULT_MAX_THREAD_POSTS = 6
+DEFAULT_MIN_THREAD_POSTS = 3
 DEFAULT_MAX_SOURCES = 3
-DEFAULT_GEN_MAX_TOKENS = 1200
+DEFAULT_GEN_MAX_TOKENS = 1600
 VALID_PROVIDERS = ("openai", "grok")
 # Obsidian: 無い／読めないときは警告して空コンテキストで続行（fail にすると下書き中止）
 DEFAULT_OBSIDIAN_MISSING_POLICY = "warn"
@@ -94,6 +103,10 @@ DEFAULT_OBSIDIAN_MAX_CHARS = 6000
 DEFAULT_OBSIDIAN_VAULT_PATH = r"C:\Users\info\Obsidian Vault"
 # Actions 向け: リポジトリ内の同期先（方法1: 公開可 .md を obsidian/ にコミット。中身があれば最優先）
 REPO_OBSIDIAN_DIRS = ("obsidian", "vault-sync")
+# 画像: 取得失敗・アップロード失敗は本文スレッド投稿を止めない
+DEFAULT_MEDIA_SOFT_FAIL = True
+IMAGE_FETCH_TIMEOUT = 12
+IMAGE_MAX_BYTES = 4_500_000  # X 画像上限付近の安全側
 
 # OpenAI / Grok 共通: 一人称の意志 + スマホ向け読みやすさ
 VOICE_FIRST_PERSON_PROMPT = """
@@ -106,9 +119,21 @@ VOICE_FIRST_PERSON_PROMPT = """
 
 【スマホ向けの読みやすさ（両モデル共通）】
 ・1文は短めにする（目安40文字前後。極端に長い一文は避ける）
-・改行を取りすぎない。1文ごとに行をバラさない
-・意味のある段落の区切りだけ空行を使い、段落内は続けて書く
+・各ポスト内では改行を取りすぎない。1文ごとに行をバラさない
+・意味のある区切りは「次のポスト」で表現する（1ポストに長い段落を詰め込まない）
 ・スマホ画面でスカスカにならない密度とリズムにする
+"""
+
+# 佐々木俊尚氏風の一連ポスト＋国内で伸びやすい短文スレッドの型
+THREAD_STYLE_PROMPT = """
+【スレッド構成（最重要・両モデル共通）】
+・600字前後の一発書きは禁止。短いポストを順番に並べた「一連のスレッド」にする
+・1ポスト目はフック（結論・違和感・現場の一言）。説明から入らない
+・2ポスト目以降は「2/」「3/」など番号か、はっきり続く接続で続ける
+・1ポスト＝1ビート。事実→現場コメント→示唆→意志、をポスト単位で分ける
+・出典の要点は各ビートか終盤に短く。URL・ハッシュタグは本文に書かない（システム後付け）
+・バズりやすい型: 先頭で「何が起きているか」を言い切り、途中で具体、最後に一人称の意志
+・読者への問いかけ・アンケート調は禁止
 """
 
 
@@ -132,8 +157,22 @@ def env_int(name: str, default: int) -> int:
 
 
 def get_max_post_chars() -> int:
-    """投稿本文のソフト上限（ハッシュタグ・URL含む最終ペイロード）。"""
+    """スレッド合計のソフト上限（後方互換・env MAX_POST_CHARS）。"""
     return max(280, env_int("MAX_POST_CHARS", DEFAULT_MAX_POST_CHARS))
+
+
+def get_max_chars_per_post() -> int:
+    """スレッド各ポストのソフト上限（本文のみ。タグ・URLは別途）。"""
+    return max(80, min(1000, env_int("MAX_CHARS_PER_POST", DEFAULT_MAX_CHARS_PER_POST)))
+
+
+def get_max_thread_posts() -> int:
+    return max(2, min(10, env_int("MAX_THREAD_POSTS", DEFAULT_MAX_THREAD_POSTS)))
+
+
+def get_min_thread_posts() -> int:
+    mn = max(2, env_int("MIN_THREAD_POSTS", DEFAULT_MIN_THREAD_POSTS))
+    return min(mn, get_max_thread_posts())
 
 
 def get_max_sources() -> int:
@@ -142,6 +181,11 @@ def get_max_sources() -> int:
 
 def get_gen_max_tokens() -> int:
     return max(200, env_int("GEN_MAX_TOKENS", DEFAULT_GEN_MAX_TOKENS))
+
+
+def media_soft_fail_enabled() -> bool:
+    raw = env_or_default("MEDIA_SOFT_FAIL", "1" if DEFAULT_MEDIA_SOFT_FAIL else "0").lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def get_openai_model() -> str:
@@ -452,6 +496,160 @@ def require_live_post_confirmation():
             "実投稿モードは無効です。"
             "意図した実投稿の場合のみ CONFIRM_LIVE_POST=1 を設定してください。"
         )
+
+
+def thread_output_instruction() -> str:
+    per = get_max_chars_per_post()
+    mn = get_min_thread_posts()
+    mx = get_max_thread_posts()
+    return f"""
+【出力形式（厳守）】
+次の JSON だけを出力する。前後に説明・箇条書き・コードフェンスを付けない。
+{{"posts":[{{"text":"1ポスト目"}},{{"text":"2ポスト目"}},...]}}
+
+制約:
+- posts は {mn}〜{mx} 件
+- 各 text は {per} 文字以内（ハッシュタグ・URLは含めない）
+- 1ポスト目はフック。説明から入らない
+- 2ポスト目以降は「2/」「3/」など番号か明確な続きでつなぐ
+- 最終ポストだけ一人称の意志で締める（問いかけ禁止）
+- ハッシュタグと URL は本文に書かない（システムが後付けする）
+"""
+
+
+def _strip_code_fence(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def parse_thread_response(raw: str) -> List[Dict[str, Any]]:
+    """
+    LLM 応答を posts リストに正規化する。
+    JSON 優先。失敗時は --- / === 区切り、それでもダメなら単一ポスト。
+    """
+    text = _strip_code_fence(raw)
+    if not text:
+        raise ValueError("スレッド本文が空です")
+
+    candidates = [text]
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        candidates.insert(0, m.group(0))
+
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("posts"), list):
+            posts = []
+            for item in data["posts"]:
+                if isinstance(item, str) and item.strip():
+                    posts.append({"text": item.strip()})
+                elif isinstance(item, dict):
+                    t = (item.get("text") or item.get("body") or "").strip()
+                    if t:
+                        post = {"text": t}
+                        if "media_source_indexes" in item:
+                            post["media_source_indexes"] = item["media_source_indexes"]
+                        posts.append(post)
+            if posts:
+                return posts
+        if isinstance(data, list) and data:
+            posts = []
+            for item in data:
+                if isinstance(item, str) and item.strip():
+                    posts.append({"text": item.strip()})
+                elif isinstance(item, dict):
+                    t = (item.get("text") or "").strip()
+                    if t:
+                        posts.append({"text": t})
+            if posts:
+                return posts
+
+    parts = re.split(r"\n\s*(?:---+|===+|\*\*\*)\s*\n", text)
+    if len(parts) >= 2:
+        return [{"text": p.strip()} for p in parts if p.strip()]
+
+    numbered = re.split(r"\n(?=\s*\d+\s*/)", text)
+    if len(numbered) >= 2:
+        return [{"text": p.strip()} for p in numbered if p.strip()]
+
+    return [{"text": text.strip()}]
+
+
+def normalize_thread_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """各ポストを整形し、文字数ソフト上限で切る。ハッシュタグ行は除去。"""
+    per = get_max_chars_per_post()
+    mx = get_max_thread_posts()
+    out: List[Dict[str, Any]] = []
+    for item in posts[:mx]:
+        raw = (item.get("text") or "").strip()
+        if not raw:
+            continue
+        clean = re.sub(r"#\S+", "", raw).rstrip()
+        clean = normalize_prose_breaks(clean)
+        if len(clean) > per:
+            clean = clean[: per - 1] + "…"
+        if not clean:
+            continue
+        post: Dict[str, Any] = {"text": clean, "char_count": len(clean)}
+        idxs = item.get("media_source_indexes")
+        if isinstance(idxs, list) and idxs:
+            post["media_source_indexes"] = [
+                int(i) for i in idxs if isinstance(i, int) or str(i).isdigit()
+            ]
+        out.append(post)
+    if not out:
+        raise ValueError("有効なスレッドポストがありません")
+    return out
+
+
+def posts_joined_text(posts: List[Dict[str, Any]]) -> str:
+    """レビュー用にビートを番号付きで連結。"""
+    lines = []
+    n = len(posts)
+    for i, p in enumerate(posts, 1):
+        lines.append(f"[{i}/{n}] {(p.get('text') or '').strip()}")
+    return "\n\n".join(lines)
+
+
+def candidate_posts(cand: dict) -> List[Dict[str, Any]]:
+    """候補から posts を取る。旧 text-only 下書きは単一ポストに落とす。"""
+    posts = cand.get("posts")
+    if isinstance(posts, list) and posts:
+        out = []
+        for p in posts:
+            if isinstance(p, dict):
+                t = (p.get("text") or "").strip()
+                if t:
+                    out.append({"text": t, **{k: v for k, v in p.items() if k != "text"}})
+            elif str(p).strip():
+                out.append({"text": str(p).strip()})
+        if out:
+            return out
+    text = (cand.get("text") or "").strip()
+    if text:
+        if re.search(r"^\[\d+/\d+\]", text):
+            chunks = re.split(r"\n\n(?=\[\d+/\d+\])", text)
+            out = []
+            for ch in chunks:
+                body = re.sub(r"^\[\d+/\d+\]\s*", "", ch.strip())
+                if body:
+                    out.append({"text": body})
+            if out:
+                return out
+        return [{"text": text}]
+    return []
+
+
 # =========================================================
 # 改行後処理：スマホ向けに不要な改行を抑える
 # =========================================================
@@ -617,7 +815,7 @@ EVENING_SOURCE_QUERIES = [
 
 
 def _parse_rss_items(query: str, limit: int = 3):
-    """Google News RSS から複数 item を返す。各要素: title, url, source, snippet, query。"""
+    """Google News RSS から複数 item を返す。各要素: title, url, source, snippet, query, image_url?。"""
     import xml.etree.ElementTree as ET
     import urllib.parse
 
@@ -630,6 +828,11 @@ def _parse_rss_items(query: str, limit: int = 3):
         return []
     root = ET.fromstring(response.content)
     items = root.findall(".//item")
+    # media / content namespaces are common in RSS
+    ns = {
+        "media": "http://search.yahoo.com/mrss/",
+        "content": "http://purl.org/rss/1.0/modules/content/",
+    }
     out = []
     for item in items[: max(limit, 1)]:
         title_el = item.find("title")
@@ -647,16 +850,125 @@ def _parse_rss_items(query: str, limit: int = 3):
         snippet = ""
         if desc_el is not None and desc_el.text:
             snippet = desc_el.text.strip()[:300]
-        out.append(
-            {
-                "title": title or raw_title,
-                "url": url,
-                "source": source or "Google News",
-                "snippet": snippet,
-                "query": query,
-            }
-        )
+        image_url = _extract_rss_image_url(item, ns)
+        entry = {
+            "title": title or raw_title,
+            "url": url,
+            "source": source or "Google News",
+            "snippet": snippet,
+            "query": query,
+        }
+        if image_url:
+            entry["image_url"] = image_url
+        out.append(entry)
     return out
+
+
+def _extract_rss_image_url(item, ns) -> Optional[str]:
+    """RSS item から media:content / enclosure / img を拾う。"""
+    # media:content / media:thumbnail
+    for tag in ("media:content", "media:thumbnail"):
+        el = item.find(tag, ns)
+        if el is None:
+            # try without ns map (prefix as literal)
+            el = item.find(tag)
+        if el is not None:
+            url = el.attrib.get("url") or el.attrib.get("href")
+            if url and url.startswith("http"):
+                return url.strip()
+    enc = item.find("enclosure")
+    if enc is not None:
+        url = enc.attrib.get("url") or ""
+        mime = (enc.attrib.get("type") or "").lower()
+        if url.startswith("http") and (mime.startswith("image/") or url.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))):
+            return url.strip()
+    # description HTML 内の img
+    desc = item.find("description")
+    if desc is not None and desc.text and "<img" in desc.text.lower():
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc.text, re.I)
+        if m and m.group(1).startswith("http"):
+            return m.group(1).strip()
+    return None
+
+
+def extract_og_image(page_url: str) -> Optional[str]:
+    """記事ページの og:image / twitter:image を取得（失敗時 None）。"""
+    if not page_url or not str(page_url).startswith("http"):
+        return None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        resp = requests.get(page_url, headers=headers, timeout=IMAGE_FETCH_TIMEOUT, allow_redirects=True)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "xml" not in ctype and not resp.text.lstrip().startswith("<"):
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for prop in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
+            tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+            if tag and tag.get("content"):
+                url = tag["content"].strip()
+                if url.startswith("//"):
+                    url = "https:" + url
+                if url.startswith("http"):
+                    return url
+    except Exception as e:
+        logger.info(f"og:image 取得スキップ: {e}")
+    return None
+
+
+def enrich_sources_with_images(sources: List[dict]) -> List[dict]:
+    """
+    ソースに image_url を可能な範囲で付与する。
+    Google News 経由は publisher へ遷移して og:image を試す。失敗は soft。
+    MEDIA_ENRICH=0 でスキップ（単体テスト・オフライン用）。
+    """
+    flag = env_or_default("MEDIA_ENRICH", "1").lower()
+    if flag in ("0", "false", "off", "no"):
+        return list(sources)
+
+    enriched = []
+    for s in sources:
+        item = dict(s)
+        if item.get("image_url"):
+            enriched.append(item)
+            continue
+        url = item.get("url")
+        try:
+            img = extract_og_image(url) if url else None
+            if img:
+                item["image_url"] = img
+                item["image_status"] = "ok"
+            else:
+                item["image_status"] = "missing"
+        except Exception as e:
+            item["image_status"] = f"error:{e}"
+            logger.warning(f"画像URL解決失敗: {e}")
+        enriched.append(item)
+    return enriched
+
+
+def collect_draft_media(sources: List[dict]) -> Dict[str, Any]:
+    """下書き JSON 用の media サマリ。"""
+    images = []
+    for i, s in enumerate(sources):
+        url = s.get("image_url")
+        if url:
+            images.append(
+                {
+                    "url": url,
+                    "source_index": i,
+                    "source_title": s.get("title"),
+                    "status": s.get("image_status") or "ok",
+                }
+            )
+    return {
+        "images": images,
+        "note": "承認時に X media upload。失敗時は本文スレッドのみ投稿（MEDIA_SOFT_FAIL）。",
+    }
 
 
 def fetch_forestry_news(query, retry=True):
@@ -1052,19 +1364,19 @@ def generate_buzz_insight_tweet(
     obsidian_context=None,
 ):
     """
-    昼12時枠: 複数の国内農林業ソースを踏まえ、現場実務コメント付き投稿を生成する。
-    sources: list[dict]（推奨）。旧引数 title/snippet のみの呼び出しも互換。
+    昼12時枠: 複数の国内農林業ソースを踏まえ、現場実務コメント付きスレッドを生成する。
+    戻り値は posts リスト（dict）。後方互換のため呼び出し側が正規化する。
     """
     if not sources and (article_title or article_snippet):
         sources = [{"title": article_title or "", "snippet": article_snippet or "", "url": "", "source": ""}]
     if not sources:
         raise ValueError("sources が空です")
 
-    max_chars = get_max_post_chars()
+    per = get_max_chars_per_post()
     n = len(sources)
     system_prompt = f"""
 あなたは新潟で1,500ha規模の森林経営計画を管理し、将来的に3,000haへの拡大を見据える林業経営者「岸本一夫」として、
-国内の農林業・木材関連の複数ニュースを読んで、現場目線の実務的コメントを含むX投稿を作成します。
+国内の農林業・木材関連の複数ニュースを読んで、現場目線の実務的コメントを含むXスレッドを作成します。
 
 【人物像】
 ・山を「所有」ではなく「経営資源」として捉える実務家
@@ -1074,32 +1386,36 @@ def generate_buzz_insight_tweet(
 【投稿の目的】
 複数ソース（最大{n}件）に触れつつ、第一人称の現場感覚と自分の意志を語る。
 1記事の要約だけで終わらない。出典の違いや共通点にも軽く触れてよい。
+長い一発書き（数百字の壁）は禁止。短いポストの一連にする。
 
 {VOICE_FIRST_PERSON_PROMPT}
+
+{THREAD_STYLE_PROMPT}
 
 {MISLEAD_GUARD_PROMPT}
 
 {PRIVACY_GUARD_PROMPT}
 
-【構成】
-1. 複数ソースのテーマを自分の言葉で（短く）
-2. 現場目線のコメント（2〜4文程度でも可）
-3. 「私は〜と考えます」など一人称の意志・方針（問いかけで締めない）
-4. 末尾に #林業 #森林 #forest（URLは付けない。システムが後付けする）
+【スレッドの中身】
+1. フック（何が起きているか／現場の一言）
+2. ソースの要点をビート単位で（必要なら番号付き）
+3. 現場目線のコメント
+4. 最終ポスト: 「私は〜と考えます」など一人称の意志（問いかけで締めない）
 
 【文字数】
-・X Premium 前提。本文は目安 {max_chars} 文字以内（ハッシュタグ含む）。無理に短くしない。
-・URLは含めない。
+・各ポストは {per} 文字以内。URL・ハッシュタグは含めない。
+{thread_output_instruction()}
 """
 
     if obsidian_context is None:
         obsidian_context = load_obsidian_context()
 
     user_content = f"""
-以下の国内農林業・木材関連ソース（{n}件）を踏まえて投稿を作成してください。
+以下の国内農林業・木材関連ソース（{n}件）を踏まえてスレッドを作成してください。
 価格・相場は根拠が無い限り断定しないでください。
-読者への問いかけはせず、一人称の意志で締めてください。
+読者への問いかけはせず、最終ポストを一人称の意志で締めてください。
 氏名フル・メール・事務所住所／電話は本文に書かないでください。
+一発の長文ではなく、JSON の posts 配列で返してください。
 
 {format_sources_for_prompt(sources)}
 
@@ -1107,18 +1423,21 @@ def generate_buzz_insight_tweet(
 """
 
     try:
-        tweet_text = chat_complete(provider, system_prompt, user_content, temperature=0.75)
-        soft = get_max_post_chars()
-        if len(tweet_text) > soft:
-            tweet_text = chat_complete(
+        raw = chat_complete(provider, system_prompt, user_content, temperature=0.75)
+        posts = normalize_thread_posts(parse_thread_response(raw))
+        # 各ポストが上限超えなら再生成（全体）
+        if any(len(p["text"]) > per for p in posts) or len(posts) < get_min_thread_posts():
+            raw = chat_complete(
                 provider,
                 system_prompt,
-                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
+                user_content
+                + f"\n\n（再生成）各ポスト{per}文字以内、{get_min_thread_posts()}〜{get_max_thread_posts()}件の JSON posts で書き直してください。",
                 temperature=0.5,
             )
-        return tweet_text.strip()
+            posts = normalize_thread_posts(parse_thread_response(raw))
+        return posts
     except Exception as e:
-        logger.error(f"国内農林業インサイトツイート生成エラー ({provider}): {e}")
+        logger.error(f"国内農林業インサイトスレッド生成エラー ({provider}): {e}")
         raise
 
 
@@ -1126,31 +1445,34 @@ def generate_buzz_insight_tweet(
 # ツイート生成（夜20時: 産業・経営トレンド × 林業への示唆）
 # =========================================================
 def _industry_system_prompt():
-    max_chars = get_max_post_chars()
+    per = get_max_chars_per_post()
     return f"""
 あなたは新潟で1,500ha規模の森林経営計画を管理し、将来的に3,000haへの拡大を見据える林業経営者「岸本一夫」として、
-産業・経営・経済・テクノロジー分野の複数トレンド記事を読み、林業経営への示唆を含むX投稿を作成します。
+産業・経営・経済・テクノロジー分野の複数トレンド記事を読み、林業経営への示唆を含むXスレッドを作成します。
 
 【投稿の目的】
 複数の産業・経営トレンドを引用し、「林業経営ではこう読み替える」示唆を必ず入れる。
 国内農林業ニュースの単なる紹介に終始しない。
 締めは読者への問いかけではなく、一人称の意志・方針にする。
+長い一発書きは禁止。短いポストの一連にする。
 
 {VOICE_FIRST_PERSON_PROMPT}
+
+{THREAD_STYLE_PROMPT}
 
 {MISLEAD_GUARD_PROMPT}
 
 {PRIVACY_GUARD_PROMPT}
 
-【構成】
-1. 複数トレンドの要点
-2. 林業・森林経営への示唆（必須）
-3. 「私は〜と考えます」「このように思います」など一人称の意志（問いかけ禁止）
-4. 末尾ハッシュタグ #林業 #森林 #forest（URLは付けない）
+【スレッドの中身】
+1. フック（トレンドの一言）
+2. 複数トレンドの要点（ビート単位）
+3. 林業・森林経営への示唆（必須）
+4. 最終ポスト: 「私は〜と考えます」など一人称の意志（問いかけ禁止）
 
 【文字数】
-・X Premium 前提。目安 {max_chars} 文字以内。無理に短縮しない。
-・URLは含めない。
+・各ポストは {per} 文字以内。URL・ハッシュタグは含めない。
+{thread_output_instruction()}
 """
 
 
@@ -1165,7 +1487,8 @@ def generate_industry_trend_tweet(
     obsidian_context=None,
 ):
     """
-    夜20時枠: 複数の産業・経営トレンドを踏まえ、林業への示唆付き投稿を生成する。
+    夜20時枠: 複数の産業・経営トレンドを踏まえ、林業への示唆付きスレッドを生成する。
+    戻り値は posts リスト。
     """
     if not sources and (article_title or article_snippet):
         sources = [{"title": article_title or "", "snippet": article_snippet or "", "url": "", "source": ""}]
@@ -1179,8 +1502,9 @@ def generate_industry_trend_tweet(
 以下は産業・経営・経済・テクノロジー分野のソース（{len(sources)}件）です。
 国内農林業ニュースの要約だけにしないでください。
 林業経営への読み替えを必ず含め、複数ソースに触れてください。
-読者への問いかけはせず、一人称の意志で締めてください。
+読者への問いかけはせず、最終ポストを一人称の意志で締めてください。
 氏名フル・メール・事務所住所／電話は本文に書かないでください。
+一発の長文ではなく、JSON の posts 配列で返してください。
 
 {format_sources_for_prompt(sources)}
 
@@ -1188,50 +1512,51 @@ def generate_industry_trend_tweet(
 """
 
     try:
-        tweet_text = chat_complete(provider, system_prompt, user_content, temperature=0.75)
-        soft = get_max_post_chars()
-        if len(tweet_text) > soft:
-            tweet_text = chat_complete(
+        per = get_max_chars_per_post()
+        raw = chat_complete(provider, system_prompt, user_content, temperature=0.75)
+        posts = normalize_thread_posts(parse_thread_response(raw))
+        if any(len(p["text"]) > per for p in posts) or len(posts) < get_min_thread_posts():
+            raw = chat_complete(
                 provider,
                 system_prompt,
-                user_content + f"\n\n（再生成）直前案は{len(tweet_text)}文字でした。{soft}文字以内に収めてください。",
+                user_content
+                + f"\n\n（再生成）各ポスト{per}文字以内、{get_min_thread_posts()}〜{get_max_thread_posts()}件の JSON posts で書き直してください。",
                 temperature=0.5,
             )
-        return tweet_text.strip()
+            posts = normalize_thread_posts(parse_thread_response(raw))
+        return posts
     except Exception as e:
-        logger.error(f"産業・経営トレンドツイート生成エラー ({provider}): {e}")
+        logger.error(f"産業・経営トレンドスレッド生成エラー ({provider}): {e}")
         raise
 
 
 # =========================================================
-# X投稿
+# X投稿（スレッド + 任意メディア）
 # =========================================================
 HASHTAGS = "#林業 #forest"
 
+
 def build_tweet_payload(tweet_text, article_url=None):
     """
-    投稿本文を組み立てる（副作用なし）。
-    article_url は str または URL の list を受け付ける。
-    X Premium 前提でソフト上限 get_max_post_chars() のみ適用。
+    単一ポスト用の投稿本文を組み立てる（副作用なし）。
+    スレッド最終ポスト向け: ハッシュタグ + URL。
     """
     if not tweet_text:
         raise ValueError("投稿テキストが空です")
 
-    import re
-    clean_body = re.sub(r'#\S+', '', tweet_text).rstrip()
+    clean_body = re.sub(r"#\S+", "", tweet_text).rstrip()
     clean_body = normalize_prose_breaks(clean_body)
     hashtag_str = HASHTAGS
     urls = normalize_article_urls(article_url)
 
-    # URLはX上で短縮カウントされるが、ソフト上限は最終テキスト長で見る
     parts = [clean_body, hashtag_str]
     if urls:
         parts.extend(urls)
     full_text = "\n".join(parts)
 
-    soft = get_max_post_chars()
-    if len(full_text) > soft:
-        # 本文だけ削る（URL・タグは残す）
+    soft = max(get_max_chars_per_post() + 80, 280)
+    # URL 行は別カウントだが、極端に長い場合は本文を削る
+    if len(full_text) > soft + sum(len(u) for u in urls):
         overhead = len(hashtag_str) + 1 + sum(len(u) + 1 for u in urls)
         max_body = max(50, soft - overhead)
         if len(clean_body) > max_body:
@@ -1243,14 +1568,175 @@ def build_tweet_payload(tweet_text, article_url=None):
     return full_text, clean_body
 
 
-def post_to_x(tweet_text, article_url=None):
+def build_thread_payloads(posts: List[Dict[str, Any]], article_url=None) -> List[str]:
     """
-    Xにツイートを投稿する。
-    - 末尾に HASHTAGS を付ける
-    - article_url（単一または複数）を末尾に付ける
+    スレッド各ポストの最終テキストを組み立てる。
+    ハッシュタグとソース URL は最終ポストのみ。
+    """
+    if not posts:
+        raise ValueError("スレッドが空です")
+    urls = normalize_article_urls(article_url)
+    payloads = []
+    n = len(posts)
+    for i, p in enumerate(posts):
+        text = (p.get("text") if isinstance(p, dict) else str(p) or "").strip()
+        if not text:
+            raise ValueError(f"空のポストがあります: index={i}")
+        is_last = i == n - 1
+        if is_last:
+            full, _ = build_tweet_payload(text, urls)
+        else:
+            # 途中ポストは本文のみ（タグ・URLなし）
+            clean = re.sub(r"#\S+", "", text).rstrip()
+            clean = normalize_prose_breaks(clean)
+            per = get_max_chars_per_post()
+            if len(clean) > per:
+                clean = clean[: per - 1] + "…"
+            full = clean
+        payloads.append(full)
+    return payloads
+
+
+def get_tweepy_clients():
+    """v2 Client + v1.1 API（media_upload 用）。"""
+    creds = get_x_credentials()
+    client = tweepy.Client(
+        consumer_key=creds["consumer_key"],
+        consumer_secret=creds["consumer_secret"],
+        access_token=creds["access_token"],
+        access_token_secret=creds["access_token_secret"],
+    )
+    auth = tweepy.OAuth1UserHandler(
+        creds["consumer_key"],
+        creds["consumer_secret"],
+        creds["access_token"],
+        creds["access_token_secret"],
+    )
+    api_v1 = tweepy.API(auth)
+    return client, api_v1
+
+
+def download_image_to_temp(image_url: str) -> Optional[str]:
+    """画像 URL を一時ファイルへ。失敗時 None。"""
+    if not image_url or not str(image_url).startswith("http"):
+        return None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; forestry-x-bot/1.0)",
+        "Accept": "image/*,*/*",
+    }
+    try:
+        resp = requests.get(image_url, headers=headers, timeout=IMAGE_FETCH_TIMEOUT, stream=True)
+        if resp.status_code != 200:
+            logger.warning(f"画像DL失敗 status={resp.status_code} url={image_url[:120]}")
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        data = resp.content
+        if len(data) > IMAGE_MAX_BYTES:
+            logger.warning(f"画像が大きすぎます: {len(data)} bytes")
+            return None
+        if "image" not in ctype and not image_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            # 一部 CDN は octet-stream
+            if "octet-stream" not in ctype and "binary" not in ctype:
+                logger.warning(f"画像ではない Content-Type: {ctype}")
+                return None
+        ext = ".jpg"
+        if "png" in ctype or image_url.lower().endswith(".png"):
+            ext = ".png"
+        elif "webp" in ctype or image_url.lower().endswith(".webp"):
+            ext = ".webp"
+        elif "gif" in ctype or image_url.lower().endswith(".gif"):
+            ext = ".gif"
+        fd, path = tempfile.mkstemp(prefix="forestry-media-", suffix=ext)
+        os.close(fd)
+        Path(path).write_bytes(data)
+        return path
+    except Exception as e:
+        logger.warning(f"画像DL例外: {e}")
+        return None
+
+
+def upload_media_ids(api_v1, image_urls: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    画像 URL を X にアップロード。戻り値 (media_ids, errors)。
+    Soft-fail: 失敗は errors に積み、成功分だけ返す。
+    """
+    media_ids: List[str] = []
+    errors: List[str] = []
+    for url in image_urls[:4]:  # X 1ポストあたり最大4
+        path = None
+        try:
+            path = download_image_to_temp(url)
+            if not path:
+                errors.append(f"download_failed:{url[:100]}")
+                continue
+            media = api_v1.media_upload(filename=path)
+            mid = str(getattr(media, "media_id_string", None) or media.media_id)
+            media_ids.append(mid)
+            logger.info(f"media upload OK id={mid}")
+        except Exception as e:
+            msg = f"upload_failed:{e}"
+            errors.append(msg)
+            logger.warning(msg)
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    return media_ids, errors
+
+
+def resolve_thread_image_urls(draft: dict, posts: List[Dict[str, Any]]) -> List[str]:
+    """先頭ポスト（または media_source_indexes）向けの画像 URL を決める。"""
+    sources = draft.get("sources") or []
+    media = (draft.get("media") or {}).get("images") or []
+    urls: List[str] = []
+
+    # ポスト指定があれば優先（source_index は 0-based）
+    if posts:
+        idxs = posts[0].get("media_source_indexes") if isinstance(posts[0], dict) else None
+        if isinstance(idxs, list):
+            for i in idxs:
+                try:
+                    i = int(i)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= i < len(sources) and sources[i].get("image_url"):
+                    urls.append(sources[i]["image_url"])
+
+    if not urls:
+        for img in media:
+            u = img.get("url") if isinstance(img, dict) else None
+            if u:
+                urls.append(u)
+    if not urls:
+        for s in sources:
+            if s.get("image_url"):
+                urls.append(s["image_url"])
+                break
+    # 重複除去
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:1]  # 現実的に先頭1枚
+
+
+def post_to_x(tweet_text, article_url=None, media_ids=None, in_reply_to_tweet_id=None):
+    """
+    Xに単一ツイートを投稿する（後方互換）。
+    article_url がある場合はハッシュタグ＋URLを付与。
+    成功時は tweet_id（文字列）、失敗時は False。
     """
     try:
-        full_text, _ = build_tweet_payload(tweet_text, article_url)
+        if article_url is not None:
+            full_text, _ = build_tweet_payload(tweet_text, article_url)
+        else:
+            if not tweet_text or not str(tweet_text).strip():
+                raise ValueError("投稿テキストが空です")
+            full_text = str(tweet_text).strip()
     except ValueError as e:
         logger.error(str(e))
         return False
@@ -1260,60 +1746,167 @@ def post_to_x(tweet_text, article_url=None):
         logger.info(f"記事URL付き投稿 ({len(urls)}件): {urls}")
 
     try:
-        creds = get_x_credentials()
-        client = tweepy.Client(
-            consumer_key=creds["consumer_key"],
-            consumer_secret=creds["consumer_secret"],
-            access_token=creds["access_token"],
-            access_token_secret=creds["access_token_secret"],
-        )
-        response = client.create_tweet(text=full_text)
-        tweet_id = response.data['id']
+        client, _ = get_tweepy_clients()
+        kwargs = {"text": full_text}
+        if media_ids:
+            kwargs["media_ids"] = media_ids
+        if in_reply_to_tweet_id:
+            kwargs["in_reply_to_tweet_id"] = in_reply_to_tweet_id
+        response = client.create_tweet(**kwargs)
+        tweet_id = str(response.data["id"])
         logger.info(f"投稿成功！ Tweet ID: {tweet_id}")
         logger.info(f"投稿内容: {full_text}")
-        logger.info(f"文字数(最終): {len(full_text)} / soft_max={get_max_post_chars()}")
-        return True
+        logger.info(f"文字数(最終): {len(full_text)}")
+        return tweet_id
     except Exception as e:
         logger.error(f"X投稿エラー: {e}")
         return False
 
 
+def post_thread_to_x(
+    posts: List[Dict[str, Any]],
+    article_url=None,
+    image_urls: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    スレッドを reply 連鎖で投稿する。
+    画像アップロード失敗は soft-fail（MEDIA_SOFT_FAIL）で本文のみ続行。
+    戻り値: {ok, tweet_ids, media_errors, root_tweet_id}
+    """
+    payloads = build_thread_payloads(posts, article_url)
+    media_ids: List[str] = []
+    media_errors: List[str] = []
+    client, api_v1 = get_tweepy_clients()
+
+    if image_urls:
+        try:
+            media_ids, media_errors = upload_media_ids(api_v1, image_urls)
+        except Exception as e:
+            media_errors.append(str(e))
+            logger.warning(f"media upload 全体失敗: {e}")
+            if not media_soft_fail_enabled():
+                raise
+
+    tweet_ids = []
+    reply_to = None
+    for i, text in enumerate(payloads):
+        kwargs = {"text": text}
+        if reply_to:
+            kwargs["in_reply_to_tweet_id"] = reply_to
+        if i == 0 and media_ids:
+            kwargs["media_ids"] = media_ids
+        try:
+            response = client.create_tweet(**kwargs)
+            tid = str(response.data["id"])
+            tweet_ids.append(tid)
+            reply_to = tid
+            logger.info(f"スレッド投稿 [{i+1}/{len(payloads)}] id={tid} chars={len(text)}")
+            logger.info(f"内容: {text}")
+        except Exception as e:
+            # メディア付き1ポスト目が失敗したら、メディア無しで再試行（soft-fail）
+            if i == 0 and media_ids and media_soft_fail_enabled():
+                logger.warning(f"メディア付き投稿失敗、テキストのみ再試行: {e}")
+                media_errors.append(f"attach_failed:{e}")
+                try:
+                    response = client.create_tweet(text=text)
+                    tid = str(response.data["id"])
+                    tweet_ids.append(tid)
+                    reply_to = tid
+                    logger.info(f"スレッド投稿(テキストのみ) [1/{len(payloads)}] id={tid}")
+                    continue
+                except Exception as e2:
+                    logger.error(f"スレッド投稿失敗: {e2}")
+                    return {
+                        "ok": False,
+                        "tweet_ids": tweet_ids,
+                        "media_errors": media_errors,
+                        "root_tweet_id": tweet_ids[0] if tweet_ids else None,
+                        "error": str(e2),
+                    }
+            logger.error(f"スレッド投稿失敗 [{i+1}]: {e}")
+            return {
+                "ok": False,
+                "tweet_ids": tweet_ids,
+                "media_errors": media_errors,
+                "root_tweet_id": tweet_ids[0] if tweet_ids else None,
+                "error": str(e),
+            }
+
+    return {
+        "ok": True,
+        "tweet_ids": tweet_ids,
+        "media_errors": media_errors,
+        "root_tweet_id": tweet_ids[0] if tweet_ids else None,
+    }
+
+
 def ensure_post_ready(tweet, article_url):
-    """URL・本文・投稿成否を検査し、失敗時は RuntimeError を送出する。"""
+    """URL・本文・投稿成否を検査し、失敗時は RuntimeError を送出する（単一ポスト互換）。"""
     urls = normalize_article_urls(article_url)
     if not urls:
         raise RuntimeError("記事URLが取得できないため投稿を中止しました")
     if not tweet:
         raise RuntimeError("投稿文を生成できませんでした")
-    if not post_to_x(tweet, urls):
+    result = post_to_x(tweet, urls)
+    if not result:
         raise RuntimeError("Xへの投稿に失敗しました")
+    return result
+
+
+def ensure_thread_ready(posts, article_url, image_urls=None):
+    """スレッド投稿。失敗時 RuntimeError。"""
+    urls = normalize_article_urls(article_url)
+    if not urls:
+        raise RuntimeError("記事URLが取得できないため投稿を中止しました")
+    if not posts:
+        raise RuntimeError("スレッドが空です")
+    result = post_thread_to_x(posts, urls, image_urls=image_urls or [])
+    if not result.get("ok"):
+        raise RuntimeError(f"Xへのスレッド投稿に失敗しました: {result.get('error')}")
+    if result.get("media_errors"):
+        logger.warning(f"メディア警告（本文は投稿済み）: {result['media_errors']}")
+    return result
 
 
 def print_draft_for_human(draft: dict):
-    """Cursor / ログ向けに二系統案を見やすく出す。"""
+    """Cursor / ログ向けに二系統スレッド案を見やすく出す。"""
     logger.info("=" * 60)
     logger.info(f"DRAFT_ID: {draft['id']}")
     logger.info(f"SLOT: {draft['slot']}")
     logger.info(f"STATUS: {draft.get('status')}")
+    logger.info(f"FORMAT: {draft.get('format') or 'thread'}")
     sources = draft.get("sources") or []
     if sources:
         logger.info(f"SOURCES ({len(sources)}):")
         for i, s in enumerate(sources, 1):
             logger.info(f"  {i}. [{s.get('label') or s.get('source')}] {s.get('title')}")
             logger.info(f"     {s.get('url')}")
+            if s.get("image_url"):
+                logger.info(f"     image: {s.get('image_url')}")
     else:
         art = draft.get("article") or {}
         logger.info(f"ARTICLE: {art.get('title')}")
         logger.info(f"URL: {art.get('url')}")
+    media_imgs = ((draft.get("media") or {}).get("images")) or []
+    logger.info(f"MEDIA images: {len(media_imgs)}")
     for provider in VALID_PROVIDERS:
         cand = (draft.get("candidates") or {}).get(provider) or {}
         logger.info("-" * 40)
-        logger.info(f"[{provider}] guard_ok={cand.get('guard_ok')} flags={cand.get('flags')}")
+        logger.info(
+            f"[{provider}] guard_ok={cand.get('guard_ok')} flags={cand.get('flags')} "
+            f"thread_count={cand.get('thread_count') or len(cand.get('posts') or [])}"
+        )
         if cand.get("error"):
             logger.info(f"[{provider}] error: {cand['error']}")
         else:
-            text = cand.get("text") or ""
-            logger.info(f"[{provider}] chars={len(text)}\n{text}")
+            posts = candidate_posts(cand)
+            if posts:
+                for i, p in enumerate(posts, 1):
+                    t = p.get("text") or ""
+                    logger.info(f"[{provider}] [{i}/{len(posts)}] chars={len(t)}\n{t}")
+            else:
+                text = cand.get("text") or ""
+                logger.info(f"[{provider}] chars={len(text)}\n{text}")
     logger.info("=" * 60)
     logger.info(
         "承認後の投稿例: CONFIRM_LIVE_POST=1 python forestry_bot.py approve "
@@ -1321,21 +1914,41 @@ def print_draft_for_human(draft: dict):
     )
 
 
+def _coerce_generator_posts(raw) -> List[Dict[str, Any]]:
+    """generator 戻り値を posts に揃える（list / JSON文字列 / 旧プレーン文字列）。"""
+    if isinstance(raw, list):
+        return [
+            (p if isinstance(p, dict) else {"text": str(p)})
+            for p in raw
+        ]
+    if isinstance(raw, dict) and "posts" in raw:
+        return parse_thread_response(json.dumps(raw, ensure_ascii=False))
+    if isinstance(raw, str):
+        return parse_thread_response(raw)
+    raise ValueError(f"未対応の generator 戻り値型: {type(raw)}")
+
+
 def build_dual_candidates(sources, generator):
-    """同一ネタ（複数ソース）で openai / grok の案を作る。"""
+    """同一ネタ（複数ソース）で openai / grok のスレッド案を作る。"""
     candidates = {}
     for provider in VALID_PROVIDERS:
         model = get_openai_model() if provider == "openai" else get_grok_model()
         try:
-            text = generator(sources, provider=provider)
-            if not text or not str(text).strip():
+            raw = generator(sources, provider=provider)
+            pre_posts = _coerce_generator_posts(raw)
+            if not pre_posts:
                 raise RuntimeError(f"{provider} が空の本文を返しました (model={model})")
             # 文体 flags は正規化前（1文1行バラし等）を見る
-            _, flags_prose = check_prose_risk(text)
-            text = normalize_prose_breaks(text)
-            ok_m, flags_m = check_mislead_risk(text)
-            ok_p, flags_p = check_privacy_risk(text)
-            # empty_text は mislead 側と重複しうるので privacy 側を優先マージ
+            flags_prose: List[str] = []
+            for p in pre_posts:
+                _, fp = check_prose_risk(p.get("text") or "")
+                for f in fp:
+                    if f not in flags_prose:
+                        flags_prose.append(f)
+            posts = normalize_thread_posts(pre_posts)
+            joined = posts_joined_text(posts)
+            ok_m, flags_m = check_mislead_risk(joined)
+            ok_p, flags_p = check_privacy_risk(joined)
             flags = list(flags_m)
             for f in flags_p:
                 if f not in flags:
@@ -1345,18 +1958,22 @@ def build_dual_candidates(sources, generator):
                     flags.append(f)
             ok = ok_m and ok_p
             candidates[provider] = {
-                "text": text,
+                "posts": posts,
+                "text": joined,  # レビュー互換: 番号付き連結
+                "thread_count": len(posts),
                 "guard_ok": ok,
                 "flags": flags,
                 "model": model,
                 "error": None,
-                "char_count": len(text),
+                "char_count": sum(len(p.get("text") or "") for p in posts),
             }
         except Exception as e:
             err = str(e)
             logger.error(f"候補生成失敗 provider={provider} model={model}: {err}")
             candidates[provider] = {
+                "posts": [],
                 "text": None,
+                "thread_count": 0,
                 "guard_ok": False,
                 "flags": ["generation_error"],
                 "model": model,
@@ -1370,6 +1987,14 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
     urls = sources_as_urls(sources)
     if not urls:
         raise RuntimeError("記事URLが取得できないため下書きを中止しました")
+
+    # 画像 URL を可能な範囲で付与（失敗しても続行）
+    try:
+        sources = enrich_sources_with_images(sources)
+    except Exception as e:
+        logger.warning(f"画像 enrichment スキップ: {e}")
+
+    media = collect_draft_media(sources)
 
     # 両モデル生成前に Obsidian を一度だけ読む（無い場合は warn で空コンテキスト）
     obsidian = load_obsidian_context()
@@ -1391,7 +2016,7 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
 
     candidates = build_dual_candidates(sources, generator_with_obsidian)
     any_ok = any(
-        (c.get("text") and not c.get("error")) for c in candidates.values()
+        ((c.get("posts") or c.get("text")) and not c.get("error")) for c in candidates.values()
     )
     primary = sources[0]
     draft = {
@@ -1399,18 +2024,24 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
         "slot": slot,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "pending" if any_ok else "failed",
+        "format": "thread",
         "sources": sources,
         "urls": urls,
+        "media": media,
         # 後方互換
         "article": {
             "title": primary.get("title"),
             "snippet": (primary.get("snippet") or "")[:500],
             "url": primary.get("url"),
             "source": primary.get("source") or primary.get("label"),
+            "image_url": primary.get("image_url"),
         },
         "candidates": candidates,
         "limits": {
             "max_post_chars": get_max_post_chars(),
+            "max_chars_per_post": get_max_chars_per_post(),
+            "max_thread_posts": get_max_thread_posts(),
+            "min_thread_posts": get_min_thread_posts(),
             "max_sources": get_max_sources(),
         },
         "obsidian": {
@@ -1422,7 +2053,10 @@ def create_dual_draft(slot: str, sources, generator) -> dict:
         },
     }
     path = save_draft(draft)
-    logger.info(f"下書きを保存しました: {path} status={draft['status']} sources={len(sources)}")
+    logger.info(
+        f"下書きを保存しました: {path} status={draft['status']} "
+        f"sources={len(sources)} media={len(media.get('images') or [])}"
+    )
     print_draft_for_human(draft)
     if not any_ok:
         errors = {p: (candidates[p] or {}).get("error") for p in VALID_PROVIDERS}
@@ -1474,7 +2108,7 @@ def pre_evening_job():
 
 
 def approve_and_post(draft_id: str, provider: str):
-    """人間が選んだ provider の案だけを投稿する。"""
+    """人間が選んだ provider のスレッド案だけを投稿する。"""
     require_live_post_confirmation()
     provider = provider.lower()
     if provider not in VALID_PROVIDERS:
@@ -1485,12 +2119,12 @@ def approve_and_post(draft_id: str, provider: str):
         raise RuntimeError(f"下書き状態が pending ではありません: {draft.get('status')}")
 
     cand = (draft.get("candidates") or {}).get(provider) or {}
-    tweet = cand.get("text")
+    posts = candidate_posts(cand)
     urls = draft.get("urls") or sources_as_urls(draft.get("sources") or [])
     if not urls:
         url = (draft.get("article") or {}).get("url")
         urls = normalize_article_urls(url)
-    if not tweet:
+    if not posts:
         raise RuntimeError(f"{provider} の投稿案がありません: {cand.get('error')}")
     if cand.get("guard_ok") is False:
         logger.warning(
@@ -1499,9 +2133,28 @@ def approve_and_post(draft_id: str, provider: str):
             "氏名・メール・事務所連絡先が本文に無いことを特に確認してください。"
         )
 
-    ensure_post_ready(tweet, urls)
-    mark_draft_posted(draft_id, provider)
-    logger.info(f"承認投稿完了: draft={draft_id} provider={provider} urls={len(urls)}")
+    image_urls = resolve_thread_image_urls(draft, posts)
+    if image_urls:
+        logger.info(f"添付候補画像: {len(image_urls)} 件（失敗時は本文のみ）")
+    else:
+        logger.info("添付候補画像なし — テキストスレッドのみ投稿")
+
+    result = ensure_thread_ready(posts, urls, image_urls=image_urls)
+    root_id = result.get("root_tweet_id")
+    mark_draft_posted(draft_id, provider, tweet_id=root_id)
+    # 追加メタ
+    try:
+        d = load_draft(draft_id)
+        d["tweet_ids"] = result.get("tweet_ids") or []
+        d["media_errors"] = result.get("media_errors") or []
+        d["posted_format"] = "thread"
+        save_draft(d)
+    except Exception as e:
+        logger.warning(f"投稿メタ保存スキップ: {e}")
+    logger.info(
+        f"承認投稿完了: draft={draft_id} provider={provider} "
+        f"posts={len(posts)} urls={len(urls)} root={root_id}"
+    )
 
 
 # 互換: 旧ジョブ名は下書きのみ（実投稿しない）
@@ -1531,6 +2184,22 @@ def run_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(30)
+
+
+def dry_run_thread_format():
+    """ネットワークなしでスレッド組み立てを検証。"""
+    posts = [
+        {"text": "建築向け木材の動きがまた報じられています。"},
+        {"text": "2/ 林野庁のレポートと基本計画が同じ方向を向いています。"},
+        {"text": "私は工場向け供給を軸に、機械化で人手不足に応えます。"},
+    ]
+    urls = ["https://news.google.com/articles/example"]
+    payloads = build_thread_payloads(posts, urls)
+    assert len(payloads) == 3
+    assert HASHTAGS in payloads[-1]
+    assert urls[0] in payloads[-1]
+    assert HASHTAGS not in payloads[0]
+    logger.info("dry-run-thread-format OK\n" + "\n---\n".join(payloads))
 
 
 # =========================================================
@@ -1588,6 +2257,7 @@ if __name__ == "__main__":
         logger.info(f"dry-run payload:\n{full}")
         assert HASHTAGS in full
         assert url in full
+        dry_run_thread_format()
         logger.info("dry-run-format OK")
     elif cmd == "check-mislead":
         sample = args[1] if len(args) > 1 else "木材価格が高騰しています。"
@@ -1610,6 +2280,6 @@ if __name__ == "__main__":
             "  python forestry_bot.py list-drafts\n"
             "  python forestry_bot.py show-draft <id>\n"
             "  CONFIRM_LIVE_POST=1 python forestry_bot.py approve <id> openai|grok\n"
-            "  （主経路は GitHub Actions「林業X承認投稿」。スマホ Cursor で openai|grok を送信）\n"
+            "  （主経路は GitHub Actions「林業X承認投稿」。スレッド reply 連鎖で投稿）\n"
             "  python forestry_bot.py dry-run-format"
         )

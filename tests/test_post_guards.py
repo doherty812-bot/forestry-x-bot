@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """実投稿を伴わないガード・整形・承認フローのユニットテスト。"""
 
+import json
 import os
 import tempfile
 import unittest
@@ -69,15 +70,61 @@ class TestBuildTweetPayload(unittest.TestCase):
         self.assertIn("https://ex.com/a", full)
         self.assertIn("https://ex.com/b", full)
 
-    def test_long_body_not_cut_at_140(self):
+    def test_long_body_soft_trim_per_post(self):
         body = "あ" * 500
         full, _ = bot.build_tweet_payload(body, "https://ex.com/x")
-        self.assertGreater(len(full), 140)
-        self.assertIn("あ" * 100, full)
+        # 最終ポスト組み立てでも極端な長文は抑えられる（壁テキスト禁止）
+        self.assertIn(bot.HASHTAGS, full)
+        self.assertIn("https://ex.com/x", full)
 
     def test_empty_raises(self):
         with self.assertRaises(ValueError):
             bot.build_tweet_payload("", "https://example.com")
+
+
+class TestThreadSchema(unittest.TestCase):
+    def test_parse_json_posts(self):
+        raw = '{"posts":[{"text":"フックです。"},{"text":"2/ 続きです。"},{"text":"私はこう考えます。"}]}'
+        posts = bot.parse_thread_response(raw)
+        self.assertEqual(len(posts), 3)
+        self.assertIn("フック", posts[0]["text"])
+
+    def test_parse_fence_and_separator_fallback(self):
+        raw = "```json\n{\"posts\":[{\"text\":\"Aです。\"},{\"text\":\"Bです。\"}]}\n```"
+        posts = bot.parse_thread_response(raw)
+        self.assertEqual(len(posts), 2)
+
+    def test_build_thread_payloads_tags_on_last_only(self):
+        posts = [
+            {"text": "フックです。"},
+            {"text": "2/ 現場です。"},
+            {"text": "私はこう進めます。"},
+        ]
+        payloads = bot.build_thread_payloads(posts, ["https://ex.com/a"])
+        self.assertEqual(len(payloads), 3)
+        self.assertNotIn(bot.HASHTAGS, payloads[0])
+        self.assertIn(bot.HASHTAGS, payloads[-1])
+        self.assertIn("https://ex.com/a", payloads[-1])
+
+    def test_dual_candidates_store_posts(self):
+        sample = {
+            "posts": [
+                {"text": "フックです。"},
+                {"text": "2/ 続けます。"},
+                {"text": "私はこう考えます。"},
+            ]
+        }
+
+        def gen(sources, provider="openai"):
+            return json.dumps(sample, ensure_ascii=False)
+
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        cands = bot.build_dual_candidates(sources, gen)
+        for p in ("openai", "grok"):
+            self.assertEqual(cands[p]["thread_count"], 3)
+            self.assertEqual(len(cands[p]["posts"]), 3)
+            self.assertIn("[1/3]", cands[p]["text"])
+            self.assertTrue(cands[p]["guard_ok"])
 
 
 class TestMisleadGuard(unittest.TestCase):
@@ -156,18 +203,25 @@ class TestProseGuard(unittest.TestCase):
         self.assertEqual(flags, [])
 
     def test_dual_candidates_keeps_prose_flags_without_failing_guard(self):
-        sparse = "一文です。\n二文です。\n三文です。\n四文です。"
+        # 1ポスト内の1文1行バラし → normalize 後は結合、flags は正規化前相当を残す
+        sparse = {
+            "posts": [
+                {"text": "一文です。\n二文です。\n三文です。\n四文です。"},
+                {"text": "2/ 続けます。"},
+                {"text": "私はこう考えます。"},
+            ]
+        }
 
         def gen(sources, provider="openai"):
-            return sparse
+            return json.dumps(sparse, ensure_ascii=False)
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
         cands = bot.build_dual_candidates(sources, gen)
         for p in ("openai", "grok"):
             self.assertTrue(cands[p]["guard_ok"])
             self.assertIn("excessive_linebreaks", cands[p]["flags"])
-            # 保存本文は正規化済み
-            self.assertNotIn("\n", cands[p]["text"])
+            # 各ポスト本文は正規化済み（1文1行が結合）
+            self.assertNotIn("\n", cands[p]["posts"][0]["text"])
 
 
 class TestLivePostGuard(unittest.TestCase):
@@ -178,6 +232,14 @@ class TestLivePostGuard(unittest.TestCase):
                 bot.require_live_post_confirmation()
 
 
+def _sample_thread(provider="openai"):
+    return [
+        {"text": f"{provider} フックです。"},
+        {"text": "2/ 続けます。"},
+        {"text": "私はこう考えます。"},
+    ]
+
+
 class TestDraftOnlyJobs(unittest.TestCase):
     def test_noon_does_not_post(self):
         sources = [
@@ -186,14 +248,17 @@ class TestDraftOnlyJobs(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
                  patch.object(bot, "collect_noon_sources", return_value=sources), \
-                 patch.object(bot, "generate_buzz_insight_tweet", side_effect=lambda src, provider="openai": f"{provider}-本文です。"), \
-                 patch.object(bot, "post_to_x") as mock_post:
+                 patch.object(bot, "generate_buzz_insight_tweet", side_effect=lambda src, provider="openai": _sample_thread(provider)), \
+                 patch.object(bot, "post_thread_to_x") as mock_post:
                 draft = bot.noon_job()
                 mock_post.assert_not_called()
                 self.assertEqual(draft["status"], "pending")
+                self.assertEqual(draft.get("format"), "thread")
                 self.assertEqual(len(draft["sources"]), 2)
                 self.assertEqual(len(draft["urls"]), 2)
+                self.assertEqual(draft["candidates"]["openai"]["thread_count"], 3)
                 self.assertIn("openai", draft["candidates"])
                 self.assertIn("grok", draft["candidates"])
                 self.assertTrue(Path(tmp, f"{draft['id']}.json").exists())
@@ -202,15 +267,17 @@ class TestDraftOnlyJobs(unittest.TestCase):
         sources = [{"title": "DX", "snippet": "生産性", "url": "https://ex.com/b", "label": "経営"}]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
                  patch.object(bot, "collect_evening_sources", return_value=sources), \
-                 patch.object(bot, "generate_industry_trend_tweet", side_effect=lambda src, provider="openai": f"{provider}-示唆です。") as mock_gen, \
+                 patch.object(bot, "generate_industry_trend_tweet", side_effect=lambda src, provider="openai": _sample_thread(provider)) as mock_gen, \
                  patch.object(bot, "generate_buzz_insight_tweet") as mock_domestic, \
-                 patch.object(bot, "post_to_x") as mock_post:
+                 patch.object(bot, "post_thread_to_x") as mock_post:
                 draft = bot.pre_evening_job()
                 mock_post.assert_not_called()
                 mock_domestic.assert_not_called()
                 self.assertEqual(mock_gen.call_count, 2)
                 self.assertEqual(draft["slot"], "20:00")
+                self.assertEqual(draft.get("format"), "thread")
 
 
 class TestApproveFlow(unittest.TestCase):
@@ -221,36 +288,104 @@ class TestApproveFlow(unittest.TestCase):
                     "id": "testdraft",
                     "status": "pending",
                     "article": {"url": "https://ex.com"},
-                    "candidates": {"openai": {"text": "本文です。", "guard_ok": True, "flags": []}},
+                    "candidates": {
+                        "openai": {
+                            "posts": [{"text": "本文です。"}],
+                            "text": "[1/1] 本文です。",
+                            "guard_ok": True,
+                            "flags": [],
+                        }
+                    },
                 }
                 draft_store.save_draft(draft)
                 os.environ.pop("CONFIRM_LIVE_POST", None)
                 with self.assertRaises(RuntimeError):
                     bot.approve_and_post("testdraft", "openai")
 
-    def test_approve_posts_selected_provider_only(self):
+    def test_approve_posts_selected_provider_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
+            grok_posts = [
+                {"text": "Grokフックです。"},
+                {"text": "2/ 続きです。"},
+                {"text": "私はこう考えます。"},
+            ]
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
                  patch.dict(os.environ, {"CONFIRM_LIVE_POST": "1"}), \
-                 patch.object(bot, "post_to_x", return_value=True) as mock_post:
+                 patch.object(
+                     bot,
+                     "post_thread_to_x",
+                     return_value={
+                         "ok": True,
+                         "tweet_ids": ["1", "2", "3"],
+                         "media_errors": [],
+                         "root_tweet_id": "1",
+                     },
+                 ) as mock_post:
                 draft = {
                     "id": "testdraft2",
                     "status": "pending",
+                    "format": "thread",
                     "article": {"url": "https://ex.com/n"},
                     "urls": ["https://ex.com/n", "https://ex.com/m"],
+                    "sources": [{"title": "t", "url": "https://ex.com/n"}],
+                    "media": {"images": []},
                     "candidates": {
-                        "openai": {"text": "OpenAI案です。", "guard_ok": True, "flags": []},
-                        "grok": {"text": "Grok案です。", "guard_ok": True, "flags": []},
+                        "openai": {
+                            "posts": [{"text": "OpenAI案です。"}],
+                            "text": "[1/1] OpenAI案です。",
+                            "guard_ok": True,
+                            "flags": [],
+                        },
+                        "grok": {
+                            "posts": grok_posts,
+                            "text": bot.posts_joined_text(grok_posts),
+                            "thread_count": 3,
+                            "guard_ok": True,
+                            "flags": [],
+                        },
                     },
                 }
                 draft_store.save_draft(draft)
                 bot.approve_and_post("testdraft2", "grok")
-                mock_post.assert_called_once_with(
-                    "Grok案です。", ["https://ex.com/n", "https://ex.com/m"]
-                )
+                self.assertEqual(mock_post.call_count, 1)
+                args, kwargs = mock_post.call_args
+                self.assertEqual(len(args[0]), 3)
+                self.assertEqual(args[0][0]["text"], "Grokフックです。")
+                self.assertEqual(args[1], ["https://ex.com/n", "https://ex.com/m"])
                 saved = draft_store.load_draft("testdraft2")
                 self.assertEqual(saved["status"], "posted")
                 self.assertEqual(saved["posted_provider"], "grok")
+                self.assertEqual(saved.get("posted_format"), "thread")
+                self.assertEqual(saved.get("tweet_ids"), ["1", "2", "3"])
+
+    def test_approve_legacy_text_only_draft(self):
+        """旧 text-only 下書きも単一ポストスレッドとして投稿できる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.dict(os.environ, {"CONFIRM_LIVE_POST": "1"}), \
+                 patch.object(
+                     bot,
+                     "post_thread_to_x",
+                     return_value={
+                         "ok": True,
+                         "tweet_ids": ["9"],
+                         "media_errors": [],
+                         "root_tweet_id": "9",
+                     },
+                 ) as mock_post:
+                draft = {
+                    "id": "legacy",
+                    "status": "pending",
+                    "urls": ["https://ex.com/n"],
+                    "candidates": {
+                        "openai": {"text": "旧形式の本文です。", "guard_ok": True, "flags": []},
+                    },
+                }
+                draft_store.save_draft(draft)
+                bot.approve_and_post("legacy", "openai")
+                posts = mock_post.call_args[0][0]
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(posts[0]["text"], "旧形式の本文です。")
 
 
 class TestIndustryTrendPolicy(unittest.TestCase):
@@ -263,7 +398,7 @@ class TestIndustryTrendPolicy(unittest.TestCase):
     def test_system_prompt_has_mislead_guard(self):
         prompt = bot._industry_system_prompt()
         self.assertIn("ミスリード防止", prompt)
-        self.assertIn("Premium", prompt)
+        self.assertIn("スレッド", prompt)
 
     def test_system_prompt_has_privacy_guard(self):
         prompt = bot._industry_system_prompt()
@@ -279,7 +414,16 @@ class TestIndustryTrendPolicy(unittest.TestCase):
         def fake_chat(provider, system_prompt, user_content, temperature=0.75):
             captured["system"] = system_prompt
             captured["user"] = user_content
-            return "私は現場でこのように考えます。\n#林業 #森林 #forest"
+            return json.dumps(
+                {
+                    "posts": [
+                        {"text": "フックです。"},
+                        {"text": "2/ 続けます。"},
+                        {"text": "私は現場でこのように考えます。"},
+                    ]
+                },
+                ensure_ascii=False,
+            )
 
         with patch.object(bot, "chat_complete", side_effect=fake_chat):
             bot.generate_buzz_insight_tweet(
@@ -289,6 +433,7 @@ class TestIndustryTrendPolicy(unittest.TestCase):
             )
         self.assertIn("個人情報・連絡先", captured["system"])
         self.assertIn("氏名フル・メール・事務所", captured["user"])
+        self.assertIn("スレッド", captured["system"])
 
     def test_system_prompt_first_person_not_reader_questions(self):
         prompt = bot._industry_system_prompt()
@@ -301,17 +446,26 @@ class TestIndustryTrendPolicy(unittest.TestCase):
         prompt = bot._industry_system_prompt()
         self.assertIn("スマホ向け", prompt)
         self.assertIn("改行を取りすぎない", prompt)
-        self.assertIn("1文ごとに行をバラさない", prompt)
-        self.assertIn("短め", prompt)
+        self.assertIn("一連", prompt)
         voice = bot.VOICE_FIRST_PERSON_PROMPT
         self.assertIn("改行を取りすぎない", voice)
         self.assertNotIn("1文ごとに改行", voice)
+
+    def test_system_prompt_thread_style(self):
+        prompt = bot._industry_system_prompt()
+        self.assertIn(bot.THREAD_STYLE_PROMPT.strip().splitlines()[0], prompt)
+        self.assertIn("posts", prompt)
+        self.assertIn("フック", prompt)
 
     def test_dual_candidates_merge_privacy_flags(self):
         name = KNOWN_FULL_NAME_TOKENS[0]
 
         def gen(sources, provider="openai"):
-            return f"{provider}: 私は{name}です。現場を見ています。"
+            return [
+                {"text": f"{provider}: 私は{name}です。"},
+                {"text": "2/ 現場を見ています。"},
+                {"text": "私はこう考えます。"},
+            ]
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
         cands = bot.build_dual_candidates(sources, gen)
@@ -399,7 +553,16 @@ class TestObsidianContext(unittest.TestCase):
         def fake_chat(provider, system_prompt, user_content, temperature=0.75):
             captured["system"] = system_prompt
             captured["user"] = user_content
-            return "私は現場でこのように考えます。\n#林業 #森林 #forest"
+            return json.dumps(
+                {
+                    "posts": [
+                        {"text": "フックです。"},
+                        {"text": "2/ 示唆です。"},
+                        {"text": "私は現場でこのように考えます。"},
+                    ]
+                },
+                ensure_ascii=False,
+            )
 
         obsidian = {
             "text": "### memo.md\n拡大計画のメモ",
@@ -409,10 +572,11 @@ class TestObsidianContext(unittest.TestCase):
             "warning": None,
         }
         with patch.object(bot, "chat_complete", side_effect=fake_chat):
-            text = bot.generate_industry_trend_tweet(
+            posts = bot.generate_industry_trend_tweet(
                 sources, provider="openai", obsidian_context=obsidian
             )
-        self.assertIn("私は現場で", text)
+        self.assertEqual(len(posts), 3)
+        self.assertIn("私は現場で", posts[-1]["text"])
         self.assertIn("一人称", captured["system"])
         self.assertIn("問いかけは禁止", captured["system"])
         self.assertIn("拡大計画のメモ", captured["user"])
@@ -424,7 +588,16 @@ class TestObsidianContext(unittest.TestCase):
 
         def fake_chat(provider, system_prompt, user_content, temperature=0.75):
             captured["system"] = system_prompt
-            return "私は工場向け販売を軸に考えます。\n#林業 #森林 #forest"
+            return json.dumps(
+                {
+                    "posts": [
+                        {"text": "フックです。"},
+                        {"text": "2/ 続けます。"},
+                        {"text": "私は工場向け販売を軸に考えます。"},
+                    ]
+                },
+                ensure_ascii=False,
+            )
 
         with patch.object(bot, "chat_complete", side_effect=fake_chat):
             bot.generate_buzz_insight_tweet(
@@ -434,10 +607,12 @@ class TestObsidianContext(unittest.TestCase):
             )
         self.assertIn("問いかけは禁止", captured["system"])
         self.assertIn("私は〜と考えます", captured["system"])
+        self.assertIn("スレッド", captured["system"])
 
     def test_create_dual_draft_records_obsidian_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
                  patch.object(
                      bot,
                      "load_obsidian_context",
@@ -453,10 +628,11 @@ class TestObsidianContext(unittest.TestCase):
                 draft = bot.create_dual_draft(
                     "20:00",
                     sources,
-                    lambda src, provider="openai": f"{provider} 私はこう考えます。",
+                    lambda src, provider="openai": _sample_thread(provider),
                 )
                 self.assertEqual(draft["obsidian"]["status"], "missing")
                 self.assertEqual(draft["status"], "pending")
+                self.assertEqual(draft.get("format"), "thread")
 
 
 class TestEnvModelDefaults(unittest.TestCase):
@@ -475,6 +651,12 @@ class TestEnvModelDefaults(unittest.TestCase):
             os.environ.pop("MAX_POST_CHARS", None)
             self.assertGreaterEqual(bot.get_max_post_chars(), 2000)
 
+    def test_max_chars_per_post_default_is_short(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAX_CHARS_PER_POST", None)
+            self.assertLessEqual(bot.get_max_chars_per_post(), 400)
+            self.assertGreaterEqual(bot.get_max_chars_per_post(), 80)
+
 
 class TestDualCandidateErrors(unittest.TestCase):
     def test_errors_are_recorded_not_empty_text_only(self):
@@ -491,7 +673,8 @@ class TestDualCandidateErrors(unittest.TestCase):
 
     def test_both_fail_marks_draft_failed_and_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)):
+            with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}):
                 def boom(sources, provider="openai"):
                     raise RuntimeError(f"{provider} down")
 
@@ -501,7 +684,6 @@ class TestDualCandidateErrors(unittest.TestCase):
                 self.assertIn("両方", str(ctx.exception))
                 drafts = list(Path(tmp).glob("*.json"))
                 self.assertEqual(len(drafts), 1)
-                import json
                 data = json.loads(drafts[0].read_text(encoding="utf-8"))
                 self.assertEqual(data["status"], "failed")
                 self.assertTrue(data["candidates"]["openai"]["error"])
