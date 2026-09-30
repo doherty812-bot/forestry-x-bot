@@ -64,6 +64,9 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("却下", text)
         self.assertIn("ライブ投稿しない", text)
         self.assertIn(launch.PROJECT_ID, text)
+        self.assertIn("スレッド", text)
+        self.assertIn("ビート", text)
+        self.assertIn("posts", text)
 
     def test_v1_payload_no_pr(self):
         payload = launch.build_v1_payload(

@@ -3,6 +3,9 @@
 # 下書き専用の post.yml には X_* を渡さない。
 # この workflow だけが X_* + CONFIRM_LIVE_POST を扱い、confirm_live_post=true 必須。
 #
+# 投稿はスレッド（reply 連鎖）。候補に画像 URL があれば media upload を試行し、
+# 失敗しても本文スレッドは soft-fail で続行する。
+#
 # エージェントから本番投稿を勝手に回さないこと。ユーザーが openai|grok を明示したときのみ。
 
 name: 林業X承認投稿
