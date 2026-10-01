@@ -34,6 +34,7 @@ from bs4 import BeautifulSoup
 import schedule
 import json
 
+from anti_ai_copyedit import review_thread_posts
 from mislead_guard import MISLEAD_GUARD_PROMPT, check_mislead_risk
 from privacy_guard import PRIVACY_GUARD_PROMPT, check_privacy_risk
 from prose_guard import check_prose_risk, normalize_prose_breaks
@@ -1892,9 +1893,11 @@ def print_draft_for_human(draft: dict):
     for provider in VALID_PROVIDERS:
         cand = (draft.get("candidates") or {}).get(provider) or {}
         logger.info("-" * 40)
+        ce = cand.get("copyedit") or {}
         logger.info(
             f"[{provider}] guard_ok={cand.get('guard_ok')} flags={cand.get('flags')} "
-            f"thread_count={cand.get('thread_count') or len(cand.get('posts') or [])}"
+            f"thread_count={cand.get('thread_count') or len(cand.get('posts') or [])} "
+            f"copyedit={ce.get('status')} changed={ce.get('changed')}"
         )
         if cand.get("error"):
             logger.info(f"[{provider}] error: {cand['error']}")
@@ -1928,8 +1931,21 @@ def _coerce_generator_posts(raw) -> List[Dict[str, Any]]:
     raise ValueError(f"未対応の generator 戻り値型: {type(raw)}")
 
 
+def _merge_flags(*groups: List[str]) -> List[str]:
+    out: List[str] = []
+    for group in groups:
+        for f in group or []:
+            if f not in out:
+                out.append(f)
+    return out
+
+
 def build_dual_candidates(sources, generator):
-    """同一ネタ（複数ソース）で openai / grok のスレッド案を作る。"""
+    """同一ネタ（複数ソース）で openai / grok のスレッド案を作る。
+
+    各候補は生成 → 文体正規化 → anti-AI 校正レビュー → ガード、の順。
+    校正失敗は soft-fail（原文維持 + flags）。空本文の silent 化はしない。
+    """
     candidates = {}
     for provider in VALID_PROVIDERS:
         model = get_openai_model() if provider == "openai" else get_grok_model()
@@ -1946,16 +1962,51 @@ def build_dual_candidates(sources, generator):
                     if f not in flags_prose:
                         flags_prose.append(f)
             posts = normalize_thread_posts(pre_posts)
+
+            # AIっぽさ校正（第二 LLM パス）。失敗時は原文 + soft-fail flags
+            copyedit = review_thread_posts(
+                posts,
+                candidate_provider=provider,
+                chat_complete=chat_complete,
+                parse_posts=parse_thread_response,
+            )
+            reviewed = copyedit.get("posts") or posts
+            if not reviewed or not any((p.get("text") or "").strip() for p in reviewed):
+                # 校正モジュールが空を返しても silent にしない
+                logger.error(
+                    f"anti-ai copyedit が空 posts を返したため原文維持 provider={provider}"
+                )
+                reviewed = posts
+                copyedit = dict(copyedit or {})
+                copyedit["status"] = "soft_fail"
+                copyedit["error"] = copyedit.get("error") or "empty_after_review"
+                soft = list(copyedit.get("flags_after") or [])
+                if "anti_ai_copyedit_soft_fail" not in soft:
+                    soft.append("anti_ai_copyedit_soft_fail")
+                copyedit["flags_after"] = soft
+            else:
+                # 校正後もポスト上限・改行正規化を再適用
+                try:
+                    reviewed = normalize_thread_posts(reviewed)
+                except Exception as norm_err:
+                    logger.warning(
+                        f"anti-ai 校正後の正規化失敗 → 原文維持 provider={provider}: {norm_err}"
+                    )
+                    reviewed = posts
+                    copyedit = dict(copyedit or {})
+                    copyedit["status"] = "soft_fail"
+                    copyedit["error"] = str(norm_err)
+                    soft = list(copyedit.get("flags_after") or [])
+                    if "anti_ai_copyedit_soft_fail" not in soft:
+                        soft.append("anti_ai_copyedit_soft_fail")
+                    copyedit["flags_after"] = soft
+
+            posts = reviewed
             joined = posts_joined_text(posts)
             ok_m, flags_m = check_mislead_risk(joined)
             ok_p, flags_p = check_privacy_risk(joined)
-            flags = list(flags_m)
-            for f in flags_p:
-                if f not in flags:
-                    flags.append(f)
-            for f in flags_prose:
-                if f not in flags:
-                    flags.append(f)
+            flags_ai = list(copyedit.get("flags_after") or copyedit.get("flags_before") or [])
+            flags = _merge_flags(flags_m, flags_p, flags_prose, flags_ai)
             ok = ok_m and ok_p
             candidates[provider] = {
                 "posts": posts,
@@ -1966,6 +2017,14 @@ def build_dual_candidates(sources, generator):
                 "model": model,
                 "error": None,
                 "char_count": sum(len(p.get("text") or "") for p in posts),
+                "copyedit": {
+                    "status": copyedit.get("status"),
+                    "provider": copyedit.get("provider"),
+                    "changed": bool(copyedit.get("changed")),
+                    "flags_before": copyedit.get("flags_before") or [],
+                    "flags_after": copyedit.get("flags_after") or [],
+                    "error": copyedit.get("error"),
+                },
             }
         except Exception as e:
             err = str(e)
@@ -1979,6 +2038,14 @@ def build_dual_candidates(sources, generator):
                 "model": model,
                 "error": err,
                 "char_count": 0,
+                "copyedit": {
+                    "status": "skipped",
+                    "provider": None,
+                    "changed": False,
+                    "flags_before": [],
+                    "flags_after": [],
+                    "error": "generation_error",
+                },
             }
     return candidates
 
