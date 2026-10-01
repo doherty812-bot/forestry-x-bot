@@ -67,6 +67,8 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("スレッド", text)
         self.assertIn("ビート", text)
         self.assertIn("posts", text)
+        self.assertIn("anti-AI", text)
+        self.assertIn("copyedit", text)
 
     def test_v1_payload_no_pr(self):
         payload = launch.build_v1_payload(

@@ -10,6 +10,11 @@ from unittest.mock import patch
 
 import draft_store
 import forestry_bot as bot
+from anti_ai_copyedit import (
+    detect_ai_ish,
+    review_thread_posts,
+    copyedit_enabled,
+)
 from mislead_guard import check_mislead_risk
 from privacy_guard import check_privacy_risk, KNOWN_FULL_NAME_TOKENS
 from prose_guard import check_prose_risk, normalize_prose_breaks, MAX_SENTENCE_CHARS
@@ -119,12 +124,14 @@ class TestThreadSchema(unittest.TestCase):
             return json.dumps(sample, ensure_ascii=False)
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
-        cands = bot.build_dual_candidates(sources, gen)
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "0"}):
+            cands = bot.build_dual_candidates(sources, gen)
         for p in ("openai", "grok"):
             self.assertEqual(cands[p]["thread_count"], 3)
             self.assertEqual(len(cands[p]["posts"]), 3)
             self.assertIn("[1/3]", cands[p]["text"])
             self.assertTrue(cands[p]["guard_ok"])
+            self.assertEqual(cands[p]["copyedit"]["status"], "disabled")
 
 
 class TestMisleadGuard(unittest.TestCase):
@@ -216,7 +223,8 @@ class TestProseGuard(unittest.TestCase):
             return json.dumps(sparse, ensure_ascii=False)
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
-        cands = bot.build_dual_candidates(sources, gen)
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "0"}):
+            cands = bot.build_dual_candidates(sources, gen)
         for p in ("openai", "grok"):
             self.assertTrue(cands[p]["guard_ok"])
             self.assertIn("excessive_linebreaks", cands[p]["flags"])
@@ -248,7 +256,7 @@ class TestDraftOnlyJobs(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0", "ANTI_AI_COPYEDIT": "0"}), \
                  patch.object(bot, "collect_noon_sources", return_value=sources), \
                  patch.object(bot, "generate_buzz_insight_tweet", side_effect=lambda src, provider="openai": _sample_thread(provider)), \
                  patch.object(bot, "post_thread_to_x") as mock_post:
@@ -267,7 +275,7 @@ class TestDraftOnlyJobs(unittest.TestCase):
         sources = [{"title": "DX", "snippet": "生産性", "url": "https://ex.com/b", "label": "経営"}]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0", "ANTI_AI_COPYEDIT": "0"}), \
                  patch.object(bot, "collect_evening_sources", return_value=sources), \
                  patch.object(bot, "generate_industry_trend_tweet", side_effect=lambda src, provider="openai": _sample_thread(provider)) as mock_gen, \
                  patch.object(bot, "generate_buzz_insight_tweet") as mock_domestic, \
@@ -468,7 +476,8 @@ class TestIndustryTrendPolicy(unittest.TestCase):
             ]
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
-        cands = bot.build_dual_candidates(sources, gen)
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "0"}):
+            cands = bot.build_dual_candidates(sources, gen)
         for p in ("openai", "grok"):
             self.assertFalse(cands[p]["guard_ok"])
             self.assertTrue(any("pii_full_name" in f for f in cands[p]["flags"]))
@@ -612,7 +621,7 @@ class TestObsidianContext(unittest.TestCase):
     def test_create_dual_draft_records_obsidian_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}), \
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0", "ANTI_AI_COPYEDIT": "0"}), \
                  patch.object(
                      bot,
                      "load_obsidian_context",
@@ -664,7 +673,8 @@ class TestDualCandidateErrors(unittest.TestCase):
             raise RuntimeError(f"{provider} API呼び出し失敗 (model=): missing")
 
         sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
-        cands = bot.build_dual_candidates(sources, boom)
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "0"}):
+            cands = bot.build_dual_candidates(sources, boom)
         for p in ("openai", "grok"):
             self.assertIsNone(cands[p]["text"])
             self.assertIn("generation_error", cands[p]["flags"])
@@ -674,7 +684,7 @@ class TestDualCandidateErrors(unittest.TestCase):
     def test_both_fail_marks_draft_failed_and_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(draft_store, "DRAFTS_DIR", Path(tmp)), \
-                 patch.dict(os.environ, {"MEDIA_ENRICH": "0"}):
+                 patch.dict(os.environ, {"MEDIA_ENRICH": "0", "ANTI_AI_COPYEDIT": "0"}):
                 def boom(sources, provider="openai"):
                     raise RuntimeError(f"{provider} down")
 
@@ -688,6 +698,150 @@ class TestDualCandidateErrors(unittest.TestCase):
                 self.assertEqual(data["status"], "failed")
                 self.assertTrue(data["candidates"]["openai"]["error"])
                 self.assertTrue(data["candidates"]["grok"]["error"])
+
+
+class TestAntiAiCopyedit(unittest.TestCase):
+    def test_detects_ai_ish_patterns(self):
+        text = (
+            "国産材の活用は重要です。"
+            "今後の展開が注目されています。"
+            "現場でも見直すべきではないでしょうか。"
+        )
+        flags = detect_ai_ish(text)
+        self.assertTrue(any("slogan_juuyou" in f for f in flags))
+        self.assertTrue(any("slogan_chumoku" in f for f in flags))
+        self.assertTrue(any("rhetorical_deshouka" in f for f in flags))
+
+    def test_allows_first_person_voice(self):
+        text = "私は機械化で人手不足に応えます。現場ではこう進めます。"
+        self.assertEqual(detect_ai_ish(text), [])
+
+    def test_disabled_keeps_original(self):
+        posts = [
+            {"text": "フックです。重要です。"},
+            {"text": "2/ 続けます。"},
+            {"text": "私はこう考えます。"},
+        ]
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "0"}):
+            self.assertFalse(copyedit_enabled())
+            result = review_thread_posts(
+                posts,
+                candidate_provider="openai",
+                chat_complete=lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call")),
+            )
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["posts"][0]["text"], posts[0]["text"])
+        self.assertTrue(any("anti_ai:" in f for f in result["flags_before"]))
+
+    def test_soft_fail_keeps_original_on_empty_rewrite(self):
+        posts = [
+            {"text": "これは重要です。注目されています。"},
+            {"text": "2/ 現場を見ます。"},
+            {"text": "私はこう考えます。"},
+        ]
+
+        def empty_chat(provider, system, user, temperature=0.35):
+            return '{"posts":[]}'
+
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "1"}):
+            result = review_thread_posts(
+                posts,
+                candidate_provider="openai",
+                chat_complete=empty_chat,
+            )
+        self.assertEqual(result["status"], "soft_fail")
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["posts"][0]["text"], posts[0]["text"])
+        self.assertTrue(any("anti_ai_copyedit_soft_fail" in f for f in result["flags_after"]))
+
+    def test_rewrite_replaces_posts_when_ok(self):
+        posts = [
+            {"text": "国産材は重要です。注目されています。"},
+            {"text": "2/ 現場の温度差があります。"},
+            {"text": "私は機械化で進めます。"},
+        ]
+        rewritten = {
+            "posts": [
+                {"text": "国産材の供給が追いついていない。"},
+                {"text": "2/ 現場の温度差があります。"},
+                {"text": "私は機械化で進めます。"},
+            ]
+        }
+
+        def fake_chat(provider, system, user, temperature=0.35):
+            self.assertIn("校正", system)
+            return json.dumps(rewritten, ensure_ascii=False)
+
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "1", "ANTI_AI_COPYEDIT_PROVIDER": "same"}):
+            result = review_thread_posts(
+                posts,
+                candidate_provider="grok",
+                chat_complete=fake_chat,
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["provider"], "grok")
+        self.assertEqual(result["posts"][0]["text"], "国産材の供給が追いついていない。")
+        self.assertFalse(any("slogan_juuyou" in f for f in result["flags_after"]))
+
+    def test_build_dual_candidates_runs_copyedit(self):
+        sample = {
+            "posts": [
+                {"text": "これは重要です。ではないでしょうか。"},
+                {"text": "2/ 続けます。"},
+                {"text": "私はこう考えます。"},
+            ]
+        }
+        fixed = {
+            "posts": [
+                {"text": "現場では供給が追いつかない。"},
+                {"text": "2/ 続けます。"},
+                {"text": "私はこう考えます。"},
+            ]
+        }
+
+        def gen(sources, provider="openai"):
+            return json.dumps(sample, ensure_ascii=False)
+
+        def fake_chat(provider, system, user, temperature=0.75):
+            return json.dumps(fixed, ensure_ascii=False)
+
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "1"}), \
+             patch.object(bot, "chat_complete", side_effect=fake_chat):
+            cands = bot.build_dual_candidates(sources, gen)
+        for p in ("openai", "grok"):
+            self.assertEqual(cands[p]["copyedit"]["status"], "ok")
+            self.assertTrue(cands[p]["copyedit"]["changed"])
+            self.assertIn("供給が追いつかない", cands[p]["posts"][0]["text"])
+            self.assertNotIn("重要です", cands[p]["posts"][0]["text"])
+            self.assertTrue(cands[p]["guard_ok"])
+
+    def test_build_dual_candidates_soft_fail_never_empty(self):
+        sample = {
+            "posts": [
+                {"text": "フックです。"},
+                {"text": "2/ 続けます。"},
+                {"text": "私はこう考えます。"},
+            ]
+        }
+
+        def gen(sources, provider="openai"):
+            return json.dumps(sample, ensure_ascii=False)
+
+        def boom_chat(provider, system, user, temperature=0.75):
+            raise RuntimeError("copyedit API down")
+
+        sources = [{"title": "t", "snippet": "s", "url": "https://ex.com"}]
+        with patch.dict(os.environ, {"ANTI_AI_COPYEDIT": "1"}), \
+             patch.object(bot, "chat_complete", side_effect=boom_chat):
+            cands = bot.build_dual_candidates(sources, gen)
+        for p in ("openai", "grok"):
+            self.assertEqual(cands[p]["copyedit"]["status"], "soft_fail")
+            self.assertEqual(len(cands[p]["posts"]), 3)
+            self.assertTrue(cands[p]["posts"][0]["text"])
+            self.assertTrue(any("anti_ai_copyedit_soft_fail" in f for f in cands[p]["flags"]))
+            self.assertIsNone(cands[p]["error"])
 
 
 class TestMultiSourceCatalog(unittest.TestCase):

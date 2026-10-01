@@ -5,10 +5,11 @@
 ## 設計（要約）
 
 1. Actions「林業X下書き生成」または `draft 12:00|20:00` … **複数ソース** → 二系統スレッド案（投稿しない）
-2. 下書き成功後、Repo Secret `CURSOR_API_KEY` があれば **Cloud Agent が自動起動**し、スマホの Agents にレビューが届く
-3. Cursor（**スマホアプリ可**）で両案のビートを確認し、`openai` / `grok` / `却下` と送る
-4. エージェントが Actions「**林業X承認投稿**」を起動 → Secrets の `X_*` で **reply 連鎖スレッド**投稿（PC 操作不要）
-5. 記事画像 URL が取れた場合は先頭ポストへ添付を試行（失敗しても本文は投稿）
+2. 各候補に **anti-AI 校正レビュー**（第二 LLM）を通し、AIっぽい表現を削ってから artifact 化
+3. 下書き成功後、Repo Secret `CURSOR_API_KEY` があれば **Cloud Agent が自動起動**し、スマホの Agents にレビューが届く
+4. Cursor（**スマホアプリ可**）で両案のビートを確認し、`openai` / `grok` / `却下` と送る
+5. エージェントが Actions「**林業X承認投稿**」を起動 → Secrets の `X_*` で **reply 連鎖スレッド**投稿（PC 操作不要）
+6. 記事画像 URL が取れた場合は先頭ポストへ添付を試行（失敗しても本文は投稿）
 
 下書き schedule には **X Secrets を渡さない**。承認 workflow だけが `confirm_live_post=true` 必須で投稿する。  
 代替（上級者）: ローカル `CONFIRM_LIVE_POST=1 python forestry_bot.py approve ...`  
@@ -29,6 +30,10 @@
 | `MAX_SOURCES` | 任意 | 下書きに付けるソース数 1〜5（既定 3） |
 | `MEDIA_SOFT_FAIL` | 任意 | 画像失敗で本文続行（既定 1） |
 | `MEDIA_ENRICH` | 任意 | 下書き時の og:image 取得（既定 1） |
+| `ANTI_AI_COPYEDIT` | 任意 | AIっぽさ校正レビュー（既定 1）。失敗時は原文 + soft-fail flags |
+| `ANTI_AI_COPYEDIT_PROVIDER` | 任意 | `same`（候補と同じ・既定） / `openai` / `grok` |
+| `ANTI_AI_COPYEDIT_ON_FLAGS_ONLY` | 任意 | `1` なら検知時のみ LLM 校正（既定 0=毎回） |
+| `ANTI_AI_COPYEDIT_TEMPERATURE` | 任意 | 校正 LLM 温度（既定 0.35） |
 | `OBSIDIAN_VAULT_PATH` | 任意 | ローカル Obsidian vault（Windows 既定あり）。Actions は repo `obsidian/`（公開可ノートのみコミット）を優先 |
 | `OBSIDIAN_MISSING_POLICY` | 任意 | `warn`（既定・空で続行）または `fail` |
 | `CONFIRM_LIVE_POST` | 投稿時 | `1` のときのみ `approve` 可 |
@@ -55,6 +60,7 @@ unset CONFIRM_LIVE_POST
 - 二系統運用: Project の `docs/dual-ai-approval-flow.md`
 - スレッド投稿: Project の `docs/thread-style-posts.md`
 - 文体・Obsidian: Project の `docs/voice-and-obsidian.md`（Actions は方法1: 公開可ノートを `obsidian/` へ）
+- AIっぽさ校正: Project の `docs/anti-ai-copyedit.md`
 - 公開ノート同期: `obsidian/README.md` / `scripts/sync_obsidian_notes.md`
 
 エージェントからの承認起動（PAT 必須・値は Secrets）:

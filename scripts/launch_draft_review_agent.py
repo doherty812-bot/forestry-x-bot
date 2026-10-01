@@ -95,7 +95,7 @@ def build_prompt(
    - SOURCES（タイトル・出典・URL・あれば image_url）
    - openai 案と grok 案は **スレッドの各ビート** を番号付きで見せる（例: `[1/4] …` `[2/4] …`）。623字などの一発長文ブロックとして貼らない
    - `candidates.*.posts` があればそれを優先。無ければ `text` をビート分割して表示
-   - guard / PII / prose flags の要点
+   - guard / PII / prose / anti-AI copyedit flags の要点（`candidates.*.copyedit.status` と `anti_ai:*` / soft-fail）
    - 画像: `media.images` の有無（承認時に添付試行・失敗しても本文は投稿）
    - 選択依頼: `openai` / `grok` / `却下` のいずれかだけ送ってください
 5. 完了後、ユーザーがスマホの Cursor アプリで気づけるよう、最終メッセージをはっきり書く。push 通知は端末設定依存である旨を一文添えてよい。
