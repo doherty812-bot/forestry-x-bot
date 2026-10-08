@@ -80,17 +80,13 @@ jobs:
             echo "OPENAI_API_KEY が未設定です" >&2
             exit 1
           fi
-          if [ -n "${{ github.event.inputs.slot }}" ]; then
-            SLOT="${{ github.event.inputs.slot }}"
-          else
-            UTC_HOUR=$(date -u +%H)
-            case $UTC_HOUR in
-              03) SLOT="12:00" ;;
-              11) SLOT="20:00" ;;
-              *) SLOT="12:00" ;;
-            esac
-          fi
+          # schedule は数時間遅延しうる。壁時計ではなく github.event.schedule で枠を決める。
+          SLOT="$(python scripts/resolve_draft_slot.py \
+            --input-slot "${{ github.event.inputs.slot }}" \
+            --schedule-cron "${{ github.event.schedule }}" \
+            --utc-hour "$(date -u +%H)")"
           echo "下書きスロット: $SLOT（X投稿は行いません）"
+          echo "github.event.schedule=${{ github.event.schedule }}"
           echo "OPENAI_MODEL=${OPENAI_MODEL:-<code-default>}"
           echo "GROK_MODEL=${GROK_MODEL:-<code-default>}"
           echo "OBSIDIAN_VAULT_PATH=${OBSIDIAN_VAULT_PATH:-<unset>}"
@@ -103,11 +99,10 @@ jobs:
         run: |
           SLOT="${SLOT:-}"
           if [ -z "$SLOT" ]; then
-            if [ -n "${{ github.event.inputs.slot }}" ]; then
-              SLOT="${{ github.event.inputs.slot }}"
-            else
-              SLOT="12:00"
-            fi
+            SLOT="$(python scripts/resolve_draft_slot.py \
+              --input-slot "${{ github.event.inputs.slot }}" \
+              --schedule-cron "${{ github.event.schedule }}" \
+              --utc-hour "$(date -u +%H)")"
           fi
           f=$(ls -1 drafts/*.json 2>/dev/null | sort | tail -1 || true)
           if [ -z "$f" ]; then
