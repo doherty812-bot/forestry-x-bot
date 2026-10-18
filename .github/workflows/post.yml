@@ -15,6 +15,18 @@ on:
         description: '下書きスロット（12:00 / 20:00）'
         required: false
         default: '12:00'
+      sources_file:
+        description: '任意。repo 内のカスタム sources JSON（配列）。指定時は RSS を使わない'
+        required: false
+        default: ''
+      extra_instructions_file:
+        description: '任意。生成プロンプト末尾に足す指示テキストのパス'
+        required: false
+        default: ''
+      source_snippet_chars:
+        description: '任意。プロンプトに載せる snippet 文字数（既定 180）'
+        required: false
+        default: ''
 
 jobs:
   draft:
@@ -79,6 +91,30 @@ jobs:
           if [ -z "${OPENAI_API_KEY}" ]; then
             echo "OPENAI_API_KEY が未設定です" >&2
             exit 1
+          fi
+          # カスタム sources / 追加指示（workflow_dispatch のみ。schedule では空）
+          SOURCES_FILE="${{ github.event.inputs.sources_file }}"
+          EXTRA_FILE="${{ github.event.inputs.extra_instructions_file }}"
+          SNIP_CHARS="${{ github.event.inputs.source_snippet_chars }}"
+          if [ -n "${SOURCES_FILE}" ]; then
+            if [ ! -f "${SOURCES_FILE}" ]; then
+              echo "sources_file が見つかりません: ${SOURCES_FILE}" >&2
+              exit 1
+            fi
+            export DRAFT_SOURCES_FILE="${SOURCES_FILE}"
+            echo "DRAFT_SOURCES_FILE=${DRAFT_SOURCES_FILE}"
+          fi
+          if [ -n "${EXTRA_FILE}" ]; then
+            if [ ! -f "${EXTRA_FILE}" ]; then
+              echo "extra_instructions_file が見つかりません: ${EXTRA_FILE}" >&2
+              exit 1
+            fi
+            export DRAFT_EXTRA_INSTRUCTIONS="$(cat "${EXTRA_FILE}")"
+            echo "DRAFT_EXTRA_INSTRUCTIONS: $(wc -c < "${EXTRA_FILE}") bytes"
+          fi
+          if [ -n "${SNIP_CHARS}" ]; then
+            export SOURCE_SNIPPET_PROMPT_CHARS="${SNIP_CHARS}"
+            echo "SOURCE_SNIPPET_PROMPT_CHARS=${SOURCE_SNIPPET_PROMPT_CHARS}"
           fi
           # schedule は数時間遅延しうる。壁時計ではなく github.event.schedule で枠を決める。
           SLOT="$(python scripts/resolve_draft_slot.py \
