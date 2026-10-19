@@ -1027,12 +1027,82 @@ def collect_sources_from_catalog(catalog, label: str):
     return collected[:need]
 
 
+def get_source_snippet_prompt_chars() -> int:
+    """プロンプトに載せる snippet 上限。カスタム下書き向けに伸ばせる。"""
+    raw = (os.environ.get("SOURCE_SNIPPET_PROMPT_CHARS") or "").strip()
+    if not raw:
+        return 180
+    try:
+        return max(80, min(4000, int(raw)))
+    except ValueError:
+        return 180
+
+
+def get_draft_extra_instructions() -> str:
+    """DRAFT_EXTRA_INSTRUCTIONS: 生成 user プロンプト末尾に足す任意指示。"""
+    return (os.environ.get("DRAFT_EXTRA_INSTRUCTIONS") or "").strip()
+
+
+def load_injected_sources() -> Optional[List[dict]]:
+    """
+    環境変数で sources を注入する（RSS をスキップ）。
+      DRAFT_SOURCES_FILE  … JSON ファイルパス（配列）
+      DRAFT_SOURCES_JSON  … JSON 文字列（配列）
+    どちらも未設定なら None。
+    """
+    path = (os.environ.get("DRAFT_SOURCES_FILE") or "").strip()
+    raw = (os.environ.get("DRAFT_SOURCES_JSON") or "").strip()
+    if path:
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"DRAFT_SOURCES_FILE が見つかりません: {path}")
+        raw = p.read_text(encoding="utf-8")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"sources JSON の解析に失敗: {e}") from e
+    if not isinstance(data, list) or not data:
+        raise ValueError("sources JSON は非空の配列である必要があります")
+    sources: List[dict] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"sources[{i}] はオブジェクトである必要があります")
+        url = (item.get("url") or "").strip()
+        title = (item.get("title") or "").strip()
+        if not url or not title:
+            raise ValueError(f"sources[{i}] に title と url が必要です")
+        sources.append(
+            {
+                "title": title,
+                "url": url,
+                "source": item.get("source") or item.get("label") or "",
+                "snippet": item.get("snippet") or "",
+                "query": item.get("query") or "custom",
+                "label": item.get("label") or item.get("source") or "custom",
+                "image_url": item.get("image_url"),
+                "image_status": item.get("image_status"),
+            }
+        )
+    logger.info(f"注入 sources を使用: {len(sources)} 件（RSS スキップ）")
+    return sources
+
+
+def format_extra_instructions_for_prompt() -> str:
+    extra = get_draft_extra_instructions()
+    if not extra:
+        return ""
+    return f"\n\n【追加の執筆指示（必ず反映）】\n{extra}\n"
+
+
 def format_sources_for_prompt(sources) -> str:
+    snip_n = get_source_snippet_prompt_chars()
     lines = []
     for i, s in enumerate(sources, 1):
         lines.append(
             f"{i}. [{s.get('label') or s.get('source')}] {s.get('title')}\n"
-            f"   概要: {(s.get('snippet') or '（なし）')[:180]}\n"
+            f"   概要: {(s.get('snippet') or '（なし）')[:snip_n]}\n"
             f"   URL: {s.get('url')}"
         )
     return "\n".join(lines)
@@ -1421,6 +1491,7 @@ def generate_buzz_insight_tweet(
 {format_sources_for_prompt(sources)}
 
 {format_obsidian_for_prompt(obsidian_context)}
+{format_extra_instructions_for_prompt()}
 """
 
     try:
@@ -1510,6 +1581,7 @@ def generate_industry_trend_tweet(
 {format_sources_for_prompt(sources)}
 
 {format_obsidian_for_prompt(obsidian_context)}
+{format_extra_instructions_for_prompt()}
 """
 
     try:
@@ -2161,14 +2233,14 @@ def collect_evening_sources():
 def noon_job():
     """昼12時: 下書きのみ（投稿しない）。"""
     logger.info("=== 昼12時 下書き生成（OpenAI + Grok / 複数ソース）===")
-    sources = collect_noon_sources()
+    sources = load_injected_sources() or collect_noon_sources()
     return create_dual_draft("12:00", sources, generate_buzz_insight_tweet)
 
 
 def pre_evening_job():
     """夜20時: 下書きのみ（投稿しない）。"""
     logger.info("=== 夜20時 下書き生成（OpenAI + Grok / 複数ソース）===")
-    sources = collect_evening_sources()
+    sources = load_injected_sources() or collect_evening_sources()
     for s in sources:
         logger.info(f"取得: [{s.get('label')}] {s.get('title')}")
     return create_dual_draft("20:00", sources, generate_industry_trend_tweet)
