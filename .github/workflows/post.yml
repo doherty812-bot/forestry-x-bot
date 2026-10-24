@@ -159,11 +159,15 @@ jobs:
 
   # 下書き成功後: Cursor Cloud Agent を起動し、スマホアプリにレビュー会話を出す。
   # X 投稿はしない。CURSOR_API_KEY 未設定時は警告のみで draft 自体は成功のまま。
+  # 副次: GitHub Issue「林業X下書きレビュー受信箱」へリンクコメント（Issues 権限が必要）。
   notify-cursor:
     name: Cursor へ下書き通知
     needs: draft
     if: success()
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
@@ -174,10 +178,13 @@ jobs:
           python-version: '3.11'
 
       - name: Cloud Agent を起動（レビュー用・投稿なし）
+        id: launch
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           CURSOR_AGENT_MODEL: ${{ vars.CURSOR_AGENT_MODEL }}
           CURSOR_AGENT_API_VERSION: ${{ vars.CURSOR_AGENT_API_VERSION }}
+          DRAFT_NOTIFY_GITHUB_INBOX: ${{ vars.DRAFT_NOTIFY_GITHUB_INBOX }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
@@ -188,17 +195,13 @@ jobs:
           if [ -z "${CURSOR_AGENT_MODEL}" ]; then
             unset CURSOR_AGENT_MODEL
           fi
+          # 未設定 Variable は既定オン（スクリプト側）。明示 off だけ 0/false。
+          if [ -z "${DRAFT_NOTIFY_GITHUB_INBOX}" ]; then
+            export DRAFT_NOTIFY_GITHUB_INBOX=1
+          fi
           python scripts/launch_draft_review_agent.py \
             --draft-id "${{ needs.draft.outputs.draft_id }}" \
             --slot "${{ needs.draft.outputs.slot }}" \
             --run-id "${{ github.run_id }}" \
             --soft-fail
-          {
-            echo "## Cursor スマホ通知"
-            echo ""
-            echo "- DRAFT_ID: \`${{ needs.draft.outputs.draft_id }}\`"
-            echo "- スロット: ${{ needs.draft.outputs.slot }}"
-            echo "- 起動スクリプト: \`scripts/launch_draft_review_agent.py\`"
-            echo "- Secret: \`CURSOR_API_KEY\`（未設定ならこのステップは警告のみ）"
-            echo "- 手順: Project docs \`cursor-mobile-draft-notify.md\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          # agent_url / notify_status はスクリプトが GITHUB_OUTPUT・Step Summary・::notice:: に書く

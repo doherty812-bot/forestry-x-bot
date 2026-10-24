@@ -6,7 +6,7 @@
 
 1. Actions「林業X下書き生成」または `draft 12:00|20:00` … **複数ソース** → 二系統スレッド案（投稿しない）
 2. 各候補に **anti-AI 校正レビュー**（第二 LLM）を通し、AIっぽい表現を削ってから artifact 化
-3. 下書き成功後、Repo Secret `CURSOR_API_KEY` があれば **Cloud Agent が自動起動**し、スマホの Agents にレビューが届く
+3. 下書き成功後、Repo Secret `CURSOR_API_KEY` があれば **Cloud Agent が自動起動**し、スマホの **Agents 一覧**にレビューが届く（Project スレッドへの自動追記は API 非対応。副次で GitHub Issue「林業X下書きレビュー受信箱」にもリンクが付く）
 4. Cursor（**スマホアプリ可**）で両案のビートを確認し、`openai` / `grok` / `却下` と送る
 5. エージェントが Actions「**林業X承認投稿**」を起動 → Secrets の `X_*` で **reply 連鎖スレッド**投稿（PC 操作不要）
 6. 記事画像 URL が取れた場合は先頭ポストへ添付を試行（失敗しても本文は投稿）
