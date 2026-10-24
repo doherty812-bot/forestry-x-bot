@@ -213,6 +213,181 @@ def extract_agent_url(response: Any) -> Optional[str]:
     return None
 
 
+def extract_agent_id(response: Any) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    agent = response.get("agent")
+    if isinstance(agent, dict) and agent.get("id"):
+        return str(agent["id"])
+    if response.get("id"):
+        return str(response["id"])
+    return None
+
+
+def _github_annotations_enabled() -> bool:
+    return bool((os.environ.get("GITHUB_ACTIONS") or "").strip())
+
+
+def emit_github_notice(title: str, message: str) -> None:
+    """Actions アノテーション（ラン概要に表示）。秘密を含めないこと。"""
+    if not _github_annotations_enabled():
+        return
+    safe_title = title.replace("\n", " ").replace("%", "%25")[:80]
+    safe_msg = message.replace("\n", "%0A").replace("%", "%25")
+    print(f"::notice title={safe_title}::{safe_msg}")
+
+
+def emit_github_warning(title: str, message: str) -> None:
+    if not _github_annotations_enabled():
+        return
+    safe_title = title.replace("\n", " ").replace("%", "%25")[:80]
+    safe_msg = message.replace("\n", "%0A").replace("%", "%25")
+    print(f"::warning title={safe_title}::{safe_msg}", file=sys.stderr)
+
+
+def write_github_output(**fields: str) -> None:
+    path = (os.environ.get("GITHUB_OUTPUT") or "").strip()
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        for key, value in fields.items():
+            # 複数行は避け、URL/ID のみ
+            fh.write(f"{key}={value.replace(chr(10), '').replace(chr(13), '')}\n")
+
+
+def append_step_summary(markdown: str) -> None:
+    path = (os.environ.get("GITHUB_STEP_SUMMARY") or "").strip()
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(markdown)
+        if not markdown.endswith("\n"):
+            fh.write("\n")
+
+
+def github_inbox_enabled() -> bool:
+    """Repo Variable DRAFT_NOTIFY_GITHUB_INBOX。未設定は有効（副次通知の既定）。"""
+    raw = (os.environ.get("DRAFT_NOTIFY_GITHUB_INBOX") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def post_github_inbox_comment(
+    *,
+    draft_id: str,
+    slot: str,
+    agent_url: str,
+    run_url: str,
+    token: str,
+    repository: str,
+) -> Tuple[bool, str]:
+    """
+    固定 Issue「林業X下書きレビュー受信箱」へコメントし、GitHub モバイル通知を副次経路にする。
+    秘密はログに出さない。成功/失敗メッセージのみ返す。
+    """
+    owner_repo = repository.strip()
+    if owner_repo.startswith("https://github.com/"):
+        owner_repo = owner_repo[len("https://github.com/") :].rstrip("/")
+    if "/" not in owner_repo:
+        return False, "invalid repository"
+
+    api = "https://api.github.com"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "forestry-x-bot-draft-notify",
+    }
+    title = "林業X下書きレビュー受信箱"
+    marker = "<!-- forestry-x-draft-review-inbox -->"
+
+    # 既存 open issue を検索（タイトル一致）
+    q = f'repo:{owner_repo} is:issue is:open in:title "{title}"'
+    search_url = f"{api}/search/issues?q={urllib.request.quote(q)}&per_page=5"
+    req = urllib.request.Request(search_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            search_body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")[:200]
+        return False, f"issue search HTTP {e.code}: {err}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"issue search error: {type(e).__name__}"
+
+    issue_number: Optional[int] = None
+    for item in search_body.get("items") or []:
+        if isinstance(item, dict) and item.get("title") == title:
+            issue_number = int(item["number"])
+            break
+
+    if issue_number is None:
+        create_url = f"{api}/repos/{owner_repo}/issues"
+        create_payload = {
+            "title": title,
+            "body": (
+                f"{marker}\n\n"
+                "定刻／手動の下書きレビュー用 Cloud Agent のリンクをここに追記します。\n"
+                "Cursor アプリの push が届かないときの副次通知経路です（X 投稿はしません）。\n"
+                "この Issue を Watch すると GitHub モバイルにコメント通知が来ます。\n"
+            ),
+            "labels": ["draft-review-inbox"],
+        }
+        data = json.dumps(create_payload).encode("utf-8")
+        headers_post = dict(headers)
+        headers_post["Content-Type"] = "application/json"
+        req = urllib.request.Request(create_url, data=data, headers=headers_post, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                created = json.loads(resp.read().decode("utf-8"))
+                issue_number = int(created["number"])
+        except urllib.error.HTTPError as e:
+            # label が無い場合は labels なしで再試行
+            err = e.read().decode("utf-8", errors="replace")
+            if e.code == 422 and "label" in err.lower():
+                create_payload.pop("labels", None)
+                data = json.dumps(create_payload).encode("utf-8")
+                req = urllib.request.Request(
+                    create_url, data=data, headers=headers_post, method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        created = json.loads(resp.read().decode("utf-8"))
+                        issue_number = int(created["number"])
+                except urllib.error.HTTPError as e2:
+                    err2 = e2.read().decode("utf-8", errors="replace")[:200]
+                    return False, f"issue create HTTP {e2.code}: {err2}"
+            else:
+                return False, f"issue create HTTP {e.code}: {err[:200]}"
+        except Exception as e:  # noqa: BLE001
+            return False, f"issue create error: {type(e).__name__}"
+
+    slot_line = f"- スロット: {slot}\n" if slot else ""
+    comment = (
+        f"### 下書きレビュー準備完了\n\n"
+        f"- DRAFT_ID: `{draft_id}`\n"
+        f"{slot_line}"
+        f"- Cursor Agent: {agent_url}\n"
+        f"- Actions: {run_url or '(none)'}\n\n"
+        f"スマホの Cursor **Agents** 一覧で上記を開くか、リンクをタップ。"
+        f"`openai` / `grok` / `却下` を返信（ライブ投稿はこの Issue では行わない）。\n"
+    )
+    comment_url = f"{api}/repos/{owner_repo}/issues/{issue_number}/comments"
+    data = json.dumps({"body": comment}).encode("utf-8")
+    headers_post = dict(headers)
+    headers_post["Content-Type"] = "application/json"
+    req = urllib.request.Request(comment_url, data=data, headers=headers_post, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status >= 300:
+                return False, f"comment HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")[:200]
+        return False, f"comment HTTP {e.code}: {err}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"comment error: {type(e).__name__}"
+
+    return True, f"https://github.com/{owner_repo}/issues/{issue_number}"
+
+
 def launch_agent(
     *,
     api_key: str,
@@ -340,6 +515,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             "手順: docs/cursor-mobile-draft-notify.md"
         )
         print(msg, file=sys.stderr)
+        write_github_output(notify_status="missing_key", draft_id=draft_id)
+        emit_github_warning(
+            "CURSOR_API_KEY missing",
+            "下書きは成功のまま。Repo Secret CURSOR_API_KEY を設定すると Agents が起動します。",
+        )
+        append_step_summary(
+            "## Cursor スマホ通知\n\n"
+            f"- DRAFT_ID: `{draft_id}`\n"
+            f"- 結果: **CURSOR_API_KEY 未設定**（通知スキップ）\n"
+        )
         return 0 if args.soft_fail else 1
 
     status, body = launch_agent(
@@ -353,26 +538,108 @@ def main(argv: Optional[list[str]] = None) -> int:
     if status == 409 and args.api_version == "v1":
         print("agent_id_conflict: 同一 DRAFT_ID のエージェントが既にあります（重複起動スキップ）")
         print(json.dumps(body, ensure_ascii=False)[:800])
+        conflict_url = extract_agent_url(body) or (
+            f"https://cursor.com/agents/{payload.get('agentId')}"
+            if payload.get("agentId")
+            else ""
+        )
+        write_github_output(
+            notify_status="conflict",
+            draft_id=draft_id,
+            agent_id=str(payload.get("agentId") or ""),
+            agent_url=conflict_url,
+        )
+        emit_github_notice(
+            "Draft review agent already exists",
+            f"DRAFT_ID={draft_id} agent={conflict_url or payload.get('agentId')}",
+        )
+        append_step_summary(
+            "## Cursor スマホ通知\n\n"
+            f"- DRAFT_ID: `{draft_id}`\n"
+            f"- 結果: **既存エージェント（409）** — 重複起動スキップ\n"
+            + (f"- Agent: {conflict_url}\n" if conflict_url else "")
+            + "\n**開き方:** Cursor スマホ → Agents 一覧"
+            "（Project「林業エックス投稿」スレッドには自動追記されません）\n"
+        )
         return 0
 
     if status >= 400:
         print(f"Cloud Agents API 失敗: HTTP {status}", file=sys.stderr)
         # 秘密を含み得る生レスポンスは短く
         print(json.dumps(body, ensure_ascii=False)[:800], file=sys.stderr)
+        write_github_output(notify_status=f"api_error_{status}", draft_id=draft_id)
+        emit_github_warning(
+            f"Cloud Agents API HTTP {status}",
+            f"DRAFT_ID={draft_id}。下書き本体は成功のまま（soft-fail）。ログで詳細を確認。",
+        )
+        append_step_summary(
+            "## Cursor スマホ通知\n\n"
+            f"- DRAFT_ID: `{draft_id}`\n"
+            f"- 結果: **API 失敗 HTTP {status}**（下書きは成功のまま）\n"
+        )
         if args.soft_fail:
             print("続行: 下書き本体は成功のまま（通知のみ失敗）", file=sys.stderr)
             return 0
         return 1
 
     agent_url = extract_agent_url(body)
+    agent_id = extract_agent_id(body) or ""
     print(f"Cloud Agent を起動しました: HTTP {status}")
     if agent_url:
         print(f"agent_url={agent_url}")
-    # レスポンスから id だけ抜く
-    if isinstance(body, dict):
-        agent = body.get("agent") if isinstance(body.get("agent"), dict) else body
-        if isinstance(agent, dict) and agent.get("id"):
-            print(f"agent_id={agent.get('id')}")
+    if agent_id:
+        print(f"agent_id={agent_id}")
+
+    write_github_output(
+        notify_status="ok",
+        draft_id=draft_id,
+        agent_id=agent_id,
+        agent_url=agent_url or "",
+    )
+    emit_github_notice(
+        "Draft review agent launched",
+        f"DRAFT_ID={draft_id} {agent_url or agent_id}",
+    )
+    summary = (
+        "## Cursor スマホ通知\n\n"
+        f"- DRAFT_ID: `{draft_id}`\n"
+        f"- スロット: {slot or '(none)'}\n"
+        f"- 結果: **Cloud Agent 起動 HTTP {status}**\n"
+        + (f"- Agent: {agent_url}\n" if agent_url else "")
+        + (f"- agent_id: `{agent_id}`\n" if agent_id else "")
+        + "\n**開き方:** Cursor スマホアプリ → **Agents** 一覧で"
+        "「林業X下書きレビュー」を開く。"
+        "Project スレッドへの自動追記は API 非対応です。"
+        "push 通知は端末の Cursor 通知設定依存。\n"
+    )
+
+    inbox_url = ""
+    if agent_url and github_inbox_enabled():
+        gh_token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+        if gh_token:
+            ok, detail = post_github_inbox_comment(
+                draft_id=draft_id,
+                slot=slot,
+                agent_url=agent_url,
+                run_url=run_url,
+                token=gh_token,
+                repository=repo_url,
+            )
+            if ok:
+                inbox_url = detail
+                print(f"github_inbox={inbox_url}")
+                summary += f"\n- GitHub 受信箱 Issue: {inbox_url}\n"
+            else:
+                print(f"github_inbox_skip={detail}", file=sys.stderr)
+                emit_github_warning(
+                    "GitHub inbox comment failed",
+                    f"副次通知（Issue）に失敗: {detail[:120]}",
+                )
+                summary += f"\n- GitHub 受信箱: スキップ（{detail[:120]}）\n"
+        else:
+            print("github_inbox_skip=GITHUB_TOKEN unset", file=sys.stderr)
+
+    append_step_summary(summary)
     return 0
 
 

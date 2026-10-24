@@ -102,6 +102,61 @@ class TestHelpers(unittest.TestCase):
         )
         self.assertIn("cursor.com/agents", url)
 
+    def test_extract_agent_id(self):
+        aid = launch.extract_agent_id(
+            {"agent": {"id": "bc-11111111-1111-1111-1111-111111111111"}}
+        )
+        self.assertEqual(aid, "bc-11111111-1111-1111-1111-111111111111")
+
+    def test_github_inbox_enabled_default(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertTrue(launch.github_inbox_enabled())
+        with mock.patch.dict("os.environ", {"DRAFT_NOTIFY_GITHUB_INBOX": "0"}, clear=True):
+            self.assertFalse(launch.github_inbox_enabled())
+        with mock.patch.dict(
+            "os.environ", {"DRAFT_NOTIFY_GITHUB_INBOX": "false"}, clear=True
+        ):
+            self.assertFalse(launch.github_inbox_enabled())
+
+    def test_write_github_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.txt"
+            with mock.patch.dict("os.environ", {"GITHUB_OUTPUT": str(out)}, clear=False):
+                launch.write_github_output(notify_status="ok", agent_url="https://x")
+            text = out.read_text(encoding="utf-8")
+            self.assertIn("notify_status=ok", text)
+            self.assertIn("agent_url=https://x", text)
+
+    def test_launch_success_writes_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.json").write_text("{}", encoding="utf-8")
+            out = root / "gh.out"
+            summary = root / "summary.md"
+            fake_body = {
+                "agent": {
+                    "id": "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "url": "https://cursor.com/agents/bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                }
+            }
+            fake = mock.Mock(return_value=(201, fake_body))
+            env = {
+                "CURSOR_API_KEY": "test-key-not-real",
+                "GITHUB_OUTPUT": str(out),
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "DRAFT_NOTIFY_GITHUB_INBOX": "0",
+            }
+            with mock.patch.dict("os.environ", env, clear=True):
+                with mock.patch.object(launch, "launch_agent", fake):
+                    code = launch.main(
+                        ["--drafts-dir", str(root), "--draft-id", "x"]
+                    )
+            self.assertEqual(code, 0)
+            out_text = out.read_text(encoding="utf-8")
+            self.assertIn("notify_status=ok", out_text)
+            self.assertIn("agent_url=https://cursor.com/agents/", out_text)
+            self.assertIn("Cloud Agent 起動", summary.read_text(encoding="utf-8"))
+
     def test_dry_run_exit_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
